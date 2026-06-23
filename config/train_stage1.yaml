@@ -9,6 +9,10 @@ train:
   resume: false
   checkpoint_path: runs/train/geal/stage1_best.pt
   gpu: 0
+  # Interaction-image knowledge injection (PIAD only; needs dataset.use_image: true).
+  # See docs/design_interaction_image_branch2d.md.
+  img_align_weight: 0.2
+  img_align_temp: 0.07
 
 optimizer:
   lr: 1e-4
@@ -44,3 +48,7 @@ dataset:
   num_workers: 8
   shuffle: true
   data_root: laso_root
+  # Set category: piad + data_root: <PIAD_root> + use_image: true to enable the
+  # interaction-image branch. Ignored for laso (no images). img_size must be /14.
+  use_image: false
+  img_size: 224

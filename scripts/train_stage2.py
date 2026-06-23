@@ -39,8 +39,8 @@ def count_trainable_params(model):
 def build_dataloader(cfg):
     """Initialize train/test dataloaders."""
     if cfg["category"] == "piad":
-        train_dataset = PiadDataset(cfg["train_split"], cfg["setting"])
-        test_dataset = PiadDataset(cfg["test_split"])
+        train_dataset = PiadDataset(cfg["train_split"], cfg["setting"], data_root=cfg["data_root"])
+        test_dataset = PiadDataset(cfg["test_split"], data_root=cfg["data_root"])
     elif cfg["category"] == "laso":
         train_dataset = LasoDataset(cfg["train_split"], cfg["setting"], data_root=cfg["data_root"])
         test_dataset = LasoDataset(cfg["test_split"], data_root=cfg["data_root"])
@@ -142,12 +142,12 @@ def evaluate(model_3d, loader, device, criterion_hm, logger):
             total_mae += mae.item()
             total_points += n_pts
 
-            results.append(pred.cpu().numpy())
-            targets.append(label.cpu().numpy())
+            # 按样本展开，避免不同 batch 形状不一致导致 np.array 失败
+            results.extend(list(pred.cpu().numpy()))
+            targets.extend(list(label.cpu().numpy()))
 
             logger.debug(f"[Val] Batch {i}/{len(loader)} | Loss: {val_loss.item():.4f}")
 
-    results, targets = np.array(results), np.array(targets)
     mean_mae = total_mae / total_points
 
     # Compute similarity and AUC/IOU
@@ -156,9 +156,9 @@ def evaluate(model_3d, loader, device, criterion_hm, logger):
 
     IOUs, AUCs = [], []
     IOU_thres = np.linspace(0, 1, 20)
-    targets_bin = (targets >= 0.5).astype(int)
 
-    for t_true, p_score in zip(targets_bin, results):
+    for t_true, p_score in zip(targets, results):
+        t_true = (t_true >= 0.5).astype(int)     # 逐样本二值化
         if np.sum(t_true) == 0:
             continue
         auc = roc_auc_score(t_true.flatten(), p_score.flatten())
@@ -197,7 +197,6 @@ def main(cfg_path="config/train_stage2.yaml"):
     seed_torch(train_cfg["seed"])
     logger, sign = setup_logger(train_cfg)
 
-    device = torch.device(f"cuda:{train_cfg['gpu']}" if torch.cuda.is_available() else "cpu")
     train_loader, test_loader = build_dataloader({**cfg["dataset"], "batch_size": train_cfg["batch_size"]})
 
     # Build models

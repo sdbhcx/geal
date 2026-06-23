@@ -133,3 +133,23 @@ def cal_kl_loss(fmap1, fmap2):
     kl_loss = F.kl_div(log_prob1, prob2, reduction='batchmean')
 
     return kl_loss
+
+
+def info_nce(query, key, temp=0.07):
+    """
+    Symmetric-by-row InfoNCE between two sets of region-level affordance
+    embeddings. Row i of `query` (rendered-view, student) should match row i of
+    `key` (interaction-image, teacher) more than any other row in the batch.
+
+    Args:
+        query: [B, C] student embeddings (gradient flows here).
+        key:   [B, C] teacher embeddings (detach before calling to freeze teacher).
+        temp:  softmax temperature.
+    Returns:
+        scalar contrastive loss.
+    """
+    q = F.normalize(query, dim=-1)
+    k = F.normalize(key, dim=-1)
+    logits = q @ k.t() / temp                     # [B, B] cosine / temp
+    labels = torch.arange(q.size(0), device=q.device)
+    return F.cross_entropy(logits, labels)

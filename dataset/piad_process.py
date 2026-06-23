@@ -23,6 +23,49 @@ def extract_point_file(path):
 
     return points_coordinates, affordance_label
 
+def build_image_index(args):
+    """
+    Build a {(class, affordance): [image_path, ...]} index from Img_{split}.txt.
+
+    PIAD's interaction images and point clouds are NOT line-aligned (different
+    counts, different instances, no camera pose). Their only reliable linkage is
+    the (class, affordance) parsed from the image path:
+        {dataroot}/Seen/Img/Train/{Class}/{affordance}/Img_*.jpg
+    so we group images into per-(class, affordance) pools that the dataloader can
+    sample from as an affordance-localization prior. Saved as a sidecar pkl so the
+    main point pkl (and existing training) is left untouched.
+    """
+    img_split = f'{args.setting}/Img_{args.split}.txt'
+    img_list_path = os.path.join(args.dataroot, img_split)
+    if not os.path.exists(img_list_path):
+        print(f"[image-index] {img_list_path} not found, skip.")
+        return
+
+    img_index = {}
+    with open(img_list_path, 'r') as f:
+        for line in f:
+            rel = line.strip()
+            if not rel:
+                continue
+            path = rel.replace('Data', args.dataroot, 1)
+            parts = path.split('/')
+            class_label = parts[-3].lower()
+            affordance = parts[-2]
+            if affordance == 'wrapgrasp':
+                affordance = 'wrap_grasp'
+            img_index.setdefault((class_label, affordance), []).append(path)
+
+    setting_name = args.setting.lower()
+    split_name = args.split.lower()
+    out_path = os.path.join(args.dataroot, f'{setting_name}_{split_name}_img_index.pkl')
+    with open(out_path, 'wb') as f:
+        pickle.dump(img_index, f)
+
+    total = sum(len(v) for v in img_index.values())
+    print(f"[image-index] {len(img_index)} (class, affordance) groups, "
+          f"{total} images -> {out_path}")
+
+
 def main(args):
 
     train_split = f'{args.setting}/Point_{args.split}.txt'
@@ -67,6 +110,9 @@ def main(args):
         pickle.dump(data_list, f)
 
     print(f"Saved dataset to: {output_path}")
+
+    # Build the (class, affordance) -> [images] sidecar index (no-op if list missing)
+    build_image_index(args)
 
 if __name__ == "__main__":
     import argparse

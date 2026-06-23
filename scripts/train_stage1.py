@@ -13,6 +13,7 @@ sys.path.append(".")
 from utils.utils import seed_torch, read_yaml
 from utils.logger import setup_logger
 from utils.metrics import evaluating_2d
+from utils.loss import info_nce
 from renderer.gaussian_render import Gaussian_Renderer
 from model.branch_2d import Branch2D
 from dataset.laso import LasoDataset
@@ -44,7 +45,12 @@ def build_dataloader(cfg):
         train_loader, test_loader
     """
     if cfg["category"] == "piad":
-        train_dataset = PiadDataset(cfg["train_split"], cfg["setting"], data_root=cfg["data_root"])
+        # use_image enables the interaction-image branch on the TRAIN set only;
+        # the test set never needs images (alignment is a training-time loss).
+        use_image = cfg.get("use_image", False)
+        img_size = cfg.get("img_size", 224)
+        train_dataset = PiadDataset(cfg["train_split"], cfg["setting"], data_root=cfg["data_root"],
+                                    use_image=use_image, img_size=img_size)
         test_dataset = PiadDataset(cfg["test_split"], data_root=cfg["data_root"])
     elif cfg["category"] == "laso":
         train_dataset = LasoDataset(cfg["train_split"], cfg["setting"], data_root=cfg["data_root"])
@@ -94,7 +100,8 @@ def build_optimizer(model, opt_cfg):
     return optimizer, scheduler
 
 
-def train_one_epoch(model, loader, optimizer, device, renderer, logger, epoch):
+def train_one_epoch(model, loader, optimizer, device, renderer, logger, epoch,
+                    use_image=False, align_weight=0.2, temp=0.07):
     """
     Run one training epoch.
 
@@ -102,12 +109,21 @@ def train_one_epoch(model, loader, optimizer, device, renderer, logger, epoch):
       - Render GT grayscale maps from 3D points and labels
       - Forward pass through the 2D model
       - Compute binary cross-entropy loss (pixel-wise)
+      - (optional) Add InfoNCE alignment between rendered-view and interaction-image
+        affordance embeddings to inject real-image knowledge into the 2D teacher
       - Backpropagate and update weights
     """
     model.train()
     loss_sum = 0
 
-    for i, (point, _, _, question, _, label) in enumerate(loader):
+    for i, batch in enumerate(loader):
+        if use_image:
+            point, _, _, question, _, label, image = batch
+            image = image.to(device)
+        else:
+            point, _, _, question, _, label = batch
+            image = None
+
         optimizer.zero_grad()
         point, label = point.to(device), label.to(device)
 
@@ -118,16 +134,28 @@ def train_one_epoch(model, loader, optimizer, device, renderer, logger, epoch):
             gray_images = gt_images.mean(dim=2, keepdim=True).reshape(-1, 1, render_dim, render_dim)
 
         # Forward pass
-        pred = model(question, point)
+        if use_image:
+            pred, z_render, z_img = model(question, point, image=image)
+        else:
+            pred = model(question, point)
 
         # Binary classification loss (affordance heatmap)
         loss = nn.BCELoss()(pred, gray_images)
+
+        # Knowledge-injection loss (teacher detached -> student follows real image)
+        if use_image:
+            loss_align = info_nce(z_render, z_img.detach(), temp=temp)
+            loss = loss + align_weight * loss_align
+
         loss.backward()
         optimizer.step()
 
         loss_sum += loss.item()
         if i % 10 == 0:
-            logger.debug(f"[Epoch {epoch}] Iter {i}/{len(loader)} | Loss: {loss.item():.4f}")
+            msg = f"[Epoch {epoch}] Iter {i}/{len(loader)} | Loss: {loss.item():.4f}"
+            if use_image:
+                msg += f" | Align: {loss_align.item():.4f}"
+            logger.debug(msg)
 
     return loss_sum / len(loader)
 
@@ -207,11 +235,16 @@ def main(cfg_path="config/train_stage1.yaml"):
     save_dir = os.path.join(train_cfg["save_dir"], train_cfg["name"])
     os.makedirs(save_dir, exist_ok=True)
 
+    use_image = cfg["dataset"].get("use_image", False)
+    align_weight = train_cfg.get("img_align_weight", 0.2)
+    temp = train_cfg.get("img_align_temp", 0.07)
+
     for epoch in range(train_cfg["epochs"]):
         logger.debug(f"Epoch {epoch} start → learning rate {optimizer.param_groups[0]['lr']:.6f}")
 
         # Train and validate
-        train_loss = train_one_epoch(model, train_loader, optimizer, device, renderer, logger, epoch)
+        train_loss = train_one_epoch(model, train_loader, optimizer, device, renderer, logger, epoch,
+                                     use_image=use_image, align_weight=align_weight, temp=temp)
         val_mae = evaluate(model, test_loader, device, renderer, logger)
         scheduler.step()
 

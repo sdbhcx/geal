@@ -66,7 +66,7 @@ class Branch2D(nn.Module):
         )
 
         # ====== DINOv2 Backbone (frozen) ======
-        self.dino_model = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitb14').cuda()
+        self.dino_model = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitb14')
         for p in self.dino_model.parameters():
             p.requires_grad = False
 
@@ -117,16 +117,20 @@ class Branch2D(nn.Module):
 
     # ----------------------------------------------------------------------
 
-    def forward(self, text, xyz, features_3d=None):
+    def forward(self, text, xyz, features_3d=None, image=None):
         """
         Forward pass for the 2D branch.
         Args:
             text (list[str]): Batch of text queries.
             xyz (Tensor): Point cloud tensor of shape [B, N, 3].
             features_3d (Tensor): Optional 3D features from the 3D branch.
+            image (Tensor): Optional real interaction image [B, 3, H, W]. When given
+                in stage 1, the branch also returns region-level affordance embeddings
+                (z_render, z_img) for the InfoNCE knowledge-injection loss.
 
         Returns:
             Tensor: 2D affordance maps of shape [B*n_view, 1, H, W].
+            (when image is not None and stage1) tuple (attn_map, z_render, z_img).
         """
         B = xyz.shape[0]
 
@@ -176,11 +180,29 @@ class Branch2D(nn.Module):
 
             # Attention map generation
             attn = torch.einsum('blc,bcn->bln', text_feat, fused_feat.transpose(1, 2))
-            attn = attn.sum(1) / text_mask.float().sum(1).unsqueeze(-1)
+            attn = attn.sum(1) / text_mask.float().sum(1).unsqueeze(-1)   # [Bn, n_patch]
             attn_map = attn.reshape(Bn, -1, H // 14, W // 14)
             attn_map = self.learnable_upsample(torch.cat([attn_map, cls_token], dim=1))
             attn_map = torch.sigmoid(attn_map)
-            return attn_map
+
+            if image is None:
+                return attn_map
+
+            # ----- Interaction-image knowledge injection (training only) -----
+            C = text_embeds.shape[-1]
+            V = Bn // B
+
+            # Student: rendered-view affordance embedding, pooled then averaged over views
+            z_render_view = self._affordance_pool(attn, fused_feat)       # [Bn, C]
+            z_render = z_render_view.reshape(B, V, C).mean(1)             # [B, C]
+
+            # Teacher: text-conditioned affordance embedding on the real image
+            text_img = text_embeds.reshape(B, V, -1, C).mean(1)          # [B, L, C] view-agnostic
+            text_mask_img = text_mask.reshape(B, V, -1)[:, 0]            # [B, L]
+            img_feat = self._encode_image_tokens(image)                  # [B, P, C]
+            z_img, _ = self._image_affordance(text_img, text_mask_img, img_feat)
+
+            return attn_map, z_render, z_img
 
         else:
             # Stage 2: Cross-modal feature fusion (for 3D consistency)
@@ -220,6 +242,35 @@ class Branch2D(nn.Module):
         feat_tensor = feat_tensor.view(-1, self.project_dim, H, W)
 
         return render_tensor, mask_tensor, feat_tensor
+
+    # ----------------------------------------------------------------------
+
+    def _affordance_pool(self, attn, feat):
+        """Affordance-weighted pooling. attn [B, P], feat [B, P, C] -> [B, C]."""
+        w = torch.softmax(attn, dim=-1)
+        return torch.einsum('bp,bpc->bc', w, feat)
+
+    def _encode_image_tokens(self, image):
+        """Frozen-DINO patch tokens of a real interaction image -> [B, P, llm_dim]."""
+        with torch.no_grad():
+            layers = self.dino_model.get_intermediate_layers(image, n=1, return_class_token=True)
+        patch_feat = layers[-1][0]                                   # [B, P, dino_dim]
+        return self.dino_embed_norm(self.dino_embed(patch_feat))     # [B, P, llm_dim]
+
+    def _image_affordance(self, text_img, text_mask_img, img_feat):
+        """
+        Text-conditioned affordance pooling on the image branch (shared modules).
+        Returns (z [B, C] region embedding, attn [B, P] image heatmap weights).
+        """
+        cross = self.GAFM_block(text_img, img_feat)
+        tf = self.decoder(text_img, cross,
+                          tgt_key_padding_mask=text_mask_img,
+                          query_pos=self.pos1d)
+        tf = tf * text_mask_img.unsqueeze(-1).float()
+        attn = torch.einsum('blc,bcn->bln', tf, img_feat.transpose(1, 2))
+        attn = attn.sum(1) / text_mask_img.float().sum(1).unsqueeze(-1)
+        z = self._affordance_pool(attn, img_feat)
+        return z, attn
 
     # ----------------------------------------------------------------------
 

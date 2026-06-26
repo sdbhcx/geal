@@ -51,4 +51,5 @@ dataset:
   # Set category: piad + data_root: <PIAD_root> + use_image: true to enable the
   # interaction-image branch. Ignored for laso (no images). img_size must be /14.
   use_image: false
+  use_sam: true
   img_size: 224

@@ -48,9 +48,10 @@ def build_dataloader(cfg):
         # use_image enables the interaction-image branch on the TRAIN set only;
         # the test set never needs images (alignment is a training-time loss).
         use_image = cfg.get("use_image", False)
+        use_sam = cfg.get("use_sam", False)
         img_size = cfg.get("img_size", 224)
         train_dataset = PiadDataset(cfg["train_split"], cfg["setting"], data_root=cfg["data_root"],
-                                    use_image=use_image, img_size=img_size)
+                                    use_image=use_image, img_size=img_size, use_sam=use_sam)
         test_dataset = PiadDataset(cfg["test_split"], data_root=cfg["data_root"])
     elif cfg["category"] == "laso":
         train_dataset = LasoDataset(cfg["train_split"], cfg["setting"], data_root=cfg["data_root"])

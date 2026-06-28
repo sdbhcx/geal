@@ -251,11 +251,34 @@ class Branch2D(nn.Module):
         return torch.einsum('bp,bpc->bc', w, feat)
 
     def _encode_image_tokens(self, image):
-        """Frozen-DINO patch tokens of a real interaction image -> [B, P, llm_dim]."""
-        with torch.no_grad():
-            layers = self.dino_model.get_intermediate_layers(image, n=1, return_class_token=True)
-        patch_feat = layers[-1][0]                                   # [B, P, dino_dim]
-        return self.dino_embed_norm(self.dino_embed(patch_feat))     # [B, P, llm_dim]
+        """Extract features from real interaction image or SAM features -> [B, P, llm_dim]."""
+        # Check if input is SAM features (256 channels) or RGB image (3 channels)
+        if image.shape[1] == 256:
+            # Input is SAM features [B, 256, H, W]
+            B, C, H, W = image.shape
+            # Flatten spatial dimensions to sequence [B, P, 256] where P = H * W
+            sam_feat = image.flatten(2).transpose(1, 2)  # [B, H*W, 256]
+            # Project SAM features to llm_dim
+            # Create projection layer if not exists
+            if not hasattr(self, 'sam_proj'):
+                self.sam_proj = nn.Sequential(
+                    nn.Linear(256, self.llm_dim),
+                    nn.GELU(),
+                    nn.Linear(self.llm_dim, self.llm_dim)
+                ).to(image.device)
+            return self.sam_proj(sam_feat)  # [B, P, llm_dim]
+        else:
+            # Input is RGB image [B, 3, H, W], use DINOv2
+            # DINOv2 requires image dimensions to be multiples of patch size (14)
+            H, W = image.shape[2], image.shape[3]
+            pad_h = (14 - H % 14) % 14
+            pad_w = (14 - W % 14) % 14
+            if pad_h > 0 or pad_w > 0:
+                image = torch.nn.functional.pad(image, (0, pad_w, 0, pad_h), mode='constant', value=0)
+            with torch.no_grad():
+                layers = self.dino_model.get_intermediate_layers(image, n=1, return_class_token=True)
+            patch_feat = layers[-1][0]                                   # [B, P, dino_dim]
+            return self.dino_embed_norm(self.dino_embed(patch_feat))     # [B, P, llm_dim]
 
     def _image_affordance(self, text_img, text_mask_img, img_feat):
         """

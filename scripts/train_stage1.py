@@ -9,6 +9,7 @@ import os
 from torch.utils.data import DataLoader
 import sys
 sys.path.append(".")
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
 
 from utils.utils import seed_torch, read_yaml
 from utils.logger import setup_logger
@@ -44,6 +45,10 @@ def build_dataloader(cfg):
     Returns:
         train_loader, test_loader
     """
+    # Use 'spawn' start method for CUDA compatibility with multiprocessing
+    import multiprocessing
+    mp_context = multiprocessing.get_context('spawn')
+
     if cfg["category"] == "piad":
         # use_image enables the interaction-image branch on the TRAIN set only;
         # the test set never needs images (alignment is a training-time loss).
@@ -51,7 +56,7 @@ def build_dataloader(cfg):
         use_sam = cfg.get("use_sam", False)
         img_size = cfg.get("img_size", 224)
         train_dataset = PiadDataset(cfg["train_split"], cfg["setting"], data_root=cfg["data_root"],
-                                    use_image=use_image, img_size=img_size, use_sam=use_sam)
+                                    use_image=use_image, img_size=img_size, use_sam=use_sam, use_sam_features=True)
         test_dataset = PiadDataset(cfg["test_split"], data_root=cfg["data_root"])
     elif cfg["category"] == "laso":
         train_dataset = LasoDataset(cfg["train_split"], cfg["setting"], data_root=cfg["data_root"])
@@ -62,13 +67,15 @@ def build_dataloader(cfg):
         batch_size=cfg["batch_size"],
         num_workers=cfg["num_workers"],
         shuffle=cfg["shuffle"],
-        drop_last=True
+        drop_last=True,
+        multiprocessing_context=mp_context
     )
     test_loader = DataLoader(
         test_dataset,
         batch_size=cfg["batch_size"],
         num_workers=cfg["num_workers"],
-        shuffle=False
+        shuffle=False,
+        multiprocessing_context=mp_context
     )
     return train_loader, test_loader
 
@@ -118,38 +125,64 @@ def train_one_epoch(model, loader, optimizer, device, renderer, logger, epoch,
     loss_sum = 0
 
     for i, batch in enumerate(loader):
-        if use_image:
-            point, _, _, question, _, label, image = batch
-            image = image.to(device)
-        else:
-            point, _, _, question, _, label = batch
-            image = None
+        if i == 0:
+            free, total = torch.cuda.mem_get_info()
+            print(f"[显存] free={free/1024**3:.2f}G / total={total/1024**3:.2f}G "
+                f"本进程alloc={torch.cuda.memory_allocated()/1024**3:.2f}G "
+                f"模型在={next(model.parameters()).device} "
+                f"point在={device}", flush=True)
+        if i % 10 == 0:
+            alloc = torch.cuda.memory_allocated() / 1024**3
+            reserved = torch.cuda.memory_reserved() / 1024**3
+            peak = torch.cuda.max_memory_allocated() / 1024**3
+            print(f"iter{i}  alloc={alloc:.2f}G reserved={reserved:.2f}G peak={peak:.2f}G", flush=True)
+        # 训练集使用预提取的SAM特征，始终返回7个字段
+        # 第7个字段是SAM特征 [256, H/16, W/16]
+        point, _, _, question, _, label, sam_feature = batch
+        image = sam_feature.to(device) if use_image else None
 
         optimizer.zero_grad()
         point, label = point.to(device), label.to(device)
 
-        # Render ground truth grayscale maps using differentiable renderer
+        def ck(tag):                       # 每阶段强制同步,出错就钉在这一阶段
+            torch.cuda.synchronize()
+            # print(f"  ok: {tag}")        # 需要详细时可打开
+
         with torch.no_grad():
-            gt_images = torch.stack([renderer(p, l)[0] for p, l in zip(point, label)])
+             imgs = []
+        for bi, (p, l) in enumerate(zip(point, label)):
+            try:
+                img = renderer(p, l)[0]
+                torch.cuda.synchronize()
+            except RuntimeError as e:
+                torch.save({"point": p.cpu(), "label": l.cpu()},
+                        f"/tmp/bad_b{i}_i{bi}.pt")
+                print(f"崩在 batch={i} idx={bi}  N={p.shape[0]} "
+                    f"coord=[{p.min():.3f},{p.max():.3f}] "
+                    f"label=[{l.min():.3f},{l.max():.3f}] "
+                    f"finite_p={torch.isfinite(p).all().item()} "
+                    f"finite_l={torch.isfinite(l).all().item()}", flush=True)
+                raise
+            imgs.append(img)
+            gt_images = torch.stack(imgs)
             render_dim = gt_images.shape[-1]
             gray_images = gt_images.mean(dim=2, keepdim=True).reshape(-1, 1, render_dim, render_dim)
+        ck(f"iter{i}: GT渲染")
 
-        # Forward pass
         if use_image:
             pred, z_render, z_img = model(question, point, image=image)
         else:
             pred = model(question, point)
+        ck(f"iter{i}: 模型前向")
 
-        # Binary classification loss (affordance heatmap)
         loss = nn.BCELoss()(pred, gray_images)
-
-        # Knowledge-injection loss (teacher detached -> student follows real image)
         if use_image:
             loss_align = info_nce(z_render, z_img.detach(), temp=temp)
             loss = loss + align_weight * loss_align
+        ck(f"iter{i}: loss")
 
-        loss.backward()
-        optimizer.step()
+        loss.backward();  ck(f"iter{i}: backward")
+        optimizer.step(); ck(f"iter{i}: step")
 
         loss_sum += loss.item()
         if i % 10 == 0:
@@ -208,8 +241,8 @@ def main(cfg_path="config/train_stage1.yaml"):
     train_cfg = cfg["train"]
 
     # Select device
-    gpu_id = str(train_cfg.get("gpu", 0))
-    os.environ["CUDA_VISIBLE_DEVICES"] = gpu_id
+    gpu_id = str(train_cfg.get("gpu", 2))
+    # os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3"
     print(f"[INFO] Using GPU {gpu_id}")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 

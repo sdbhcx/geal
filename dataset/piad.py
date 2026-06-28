@@ -122,7 +122,8 @@ class PiadDataset(Dataset):
     """
 
     def __init__(self, split: str = "train", setting: str = "seen", data_root: str = "piad_dataset",
-                 use_image: bool = False, img_size: int = 224, use_sam: bool = False):
+                 use_image: bool = False, img_size: int = 224, use_sam: bool = False,
+                 use_sam_features: bool = False, sam_feature_dir: str = None):
         """
         Args:
             split (str): "train" or "test"
@@ -133,18 +134,21 @@ class PiadDataset(Dataset):
                 Default False keeps the original 6-tuple output untouched.
             img_size (int): square size the interaction image is resized to.
             use_sam (bool): if True, apply SAM segmentation to isolate the object.
+            use_sam_features (bool): if True, load pre-extracted SAM features instead of raw images.
+            sam_feature_dir (str): directory containing pre-extracted SAM features.
         """
         self.split = split
         self.setting = setting
         self.data_root = data_root
         self.use_image = use_image
         self.use_sam = use_sam
+        self.use_sam_features = use_sam_features
         
-        # Initialize SAM if needed
-        if self.use_sam and self.use_image:
+        # Initialize SAM if needed (for online segmentation)
+        if self.use_sam and self.use_image and not self.use_sam_features:
             sam_segmenter.initialize()
 
-        # Build class and affordance name → index mappings
+        # Build class and affordance name -> index mappings
         self.class_to_idx = {cls.lower(): i for i, cls in enumerate(CLASSES)}
         self.aff_to_idx = {aff: i for i, aff in enumerate(AFFORDANCES)}
 
@@ -158,18 +162,30 @@ class PiadDataset(Dataset):
 
         # Optionally load the (class, affordance) -> [image paths] sidecar index
         self.img_index = None
-        if self.use_image:
+        self.sam_features = None
+        
+        if self.use_image or self.use_sam_features:
             idx_path = os.path.join(data_root, f"{setting}_{split}_img_index.pkl")
             with open(idx_path, "rb") as f:
                 self.img_index = pickle.load(f)
-            self.img_transform = T.Compose([
-                T.Resize((img_size, img_size)),
-                T.ToTensor(),
-                T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-            ])
+            
+            # Load pre-extracted SAM features
+            if self.use_sam_features:
+                if sam_feature_dir is None:
+                    sam_feature_dir = os.path.join(data_root, "sam_features")
+                sam_feature_path = os.path.join(sam_feature_dir, f"{split}_sam_features_dict.pt")
+                self.sam_features = torch.load(sam_feature_path, map_location="cpu")
+                print(f"[PIAD] Loaded {len(self.sam_features)} pre-extracted SAM features")
+            else:
+                self.img_transform = T.Compose([
+                    T.Resize((img_size, img_size)),
+                    T.ToTensor(),
+                    T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+                ])
 
         print(f"[PIAD] Loaded {split} split ({len(self.annotations)} samples, "
-              f"setting={setting}, use_image={use_image}, use_sam={use_sam})")
+              f"setting={setting}, use_image={use_image}, use_sam={use_sam}, "
+              f"use_sam_features={use_sam_features})")
 
     # ------------------------------------------------------------------
     def _sample_question(self, object_name: str, affordance: str) -> str:
@@ -230,6 +246,15 @@ class PiadDataset(Dataset):
         class_id = self.class_to_idx[obj_class.lower()]
         affordance_id = self.aff_to_idx[affordance]
 
+        if self.use_sam_features:
+            # Load pre-extracted SAM feature
+            image_path = self._sample_image_path(obj_class.lower(), affordance)
+            sam_feature = self.sam_features.get(image_path)
+            if sam_feature is None:
+                # Fallback: return zeros if SAM feature not found
+                sam_feature = torch.zeros(256, 14, 14)  # Default size for 224x224 images
+            return point_input, class_id, binary_mask, questions, affordance_id, gt_mask, sam_feature
+        
         if self.use_image:
             image_pil = self._sample_image(obj_class.lower(), affordance)
             if self.use_sam:
@@ -241,6 +266,20 @@ class PiadDataset(Dataset):
         return point_input, class_id, binary_mask, questions, affordance_id, gt_mask
 
     # ------------------------------------------------------------------
+    def _sample_image_path(self, obj_class: str, affordance: str):
+        """
+        Sample one interaction image path from the (class, affordance) pool.
+
+        Returns:
+            str: Image path
+        """
+        paths = self.img_index.get((obj_class, affordance))
+        if not paths:
+            paths = [p for (c, _a), ps in self.img_index.items() if c == obj_class for p in ps]
+        if not paths:
+            raise KeyError(f"No interaction image for class={obj_class}, affordance={affordance}")
+        return random.choice(paths) if self.split == "train" else paths[0]
+    
     def _sample_image(self, obj_class: str, affordance: str):
         """
         Sample one interaction image from the (class, affordance) pool as an
@@ -250,12 +289,7 @@ class PiadDataset(Dataset):
         Returns:
             PIL.Image: Original image (before SAM processing)
         """
-        paths = self.img_index.get((obj_class, affordance))
-        if not paths:
-            paths = [p for (c, _a), ps in self.img_index.items() if c == obj_class for p in ps]
-        if not paths:
-            raise KeyError(f"No interaction image for class={obj_class}, affordance={affordance}")
-        path = random.choice(paths) if self.split == "train" else paths[0]
+        path = self._sample_image_path(obj_class, affordance)
         return Image.open(path).convert("RGB")  # Return PIL image for potential SAM processing
     
     def _apply_sam_segmentation(self, image_pil):

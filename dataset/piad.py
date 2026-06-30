@@ -123,7 +123,8 @@ class PiadDataset(Dataset):
 
     def __init__(self, split: str = "train", setting: str = "seen", data_root: str = "piad_dataset",
                  use_image: bool = False, img_size: int = 224, use_sam: bool = False,
-                 use_sam_features: bool = False, sam_feature_dir: str = None):
+                 use_sam_features: bool = False, sam_feature_dir: str = None,
+                 sam_mode: str = "masked_rgb"):
         """
         Args:
             split (str): "train" or "test"
@@ -134,8 +135,11 @@ class PiadDataset(Dataset):
                 Default False keeps the original 6-tuple output untouched.
             img_size (int): square size the interaction image is resized to.
             use_sam (bool): if True, apply SAM segmentation to isolate the object.
-            use_sam_features (bool): if True, load pre-extracted SAM features instead of raw images.
-            sam_feature_dir (str): directory containing pre-extracted SAM features.
+            use_sam_features (bool): if True, load pre-extracted SAM cache instead of raw images.
+            sam_feature_dir (str): directory containing the pre-extracted SAM cache.
+            sam_mode (str): which pre-extracted cache to use when use_sam_features is True.
+                "masked_rgb" (default): SAM-segmented foreground RGB [3,H,W], fed to DINOv2.
+                "feature": 256-d SAM image embeddings [256,H/16,W/16], fed to sam_proj.
         """
         self.split = split
         self.setting = setting
@@ -143,7 +147,12 @@ class PiadDataset(Dataset):
         self.use_image = use_image
         self.use_sam = use_sam
         self.use_sam_features = use_sam_features
-        
+        self.sam_mode = sam_mode
+        self.img_size = img_size
+        # ImageNet normalization for masked RGB (matches the rendered-view branch)
+        self.sam_normalize = T.Normalize(mean=[0.485, 0.456, 0.406],
+                                         std=[0.229, 0.224, 0.225])
+
         # Initialize SAM if needed (for online segmentation)
         if self.use_sam and self.use_image and not self.use_sam_features:
             sam_segmenter.initialize()
@@ -169,13 +178,16 @@ class PiadDataset(Dataset):
             with open(idx_path, "rb") as f:
                 self.img_index = pickle.load(f)
             
-            # Load pre-extracted SAM features
+            # Load pre-extracted SAM cache (masked RGB or 256-d features)
             if self.use_sam_features:
                 if sam_feature_dir is None:
                     sam_feature_dir = os.path.join(data_root, "sam_features")
-                sam_feature_path = os.path.join(sam_feature_dir, f"{split}_sam_features_dict.pt")
+                cache_name = f"{split}_sam_masked_rgb_dict.pt" if self.sam_mode == "masked_rgb" \
+                    else f"{split}_sam_features_dict.pt"
+                sam_feature_path = os.path.join(sam_feature_dir, cache_name)
                 self.sam_features = torch.load(sam_feature_path, map_location="cpu")
-                print(f"[PIAD] Loaded {len(self.sam_features)} pre-extracted SAM features")
+                print(f"[PIAD] Loaded {len(self.sam_features)} pre-extracted SAM "
+                      f"'{self.sam_mode}' entries from {cache_name}")
             else:
                 self.img_transform = T.Compose([
                     T.Resize((img_size, img_size)),
@@ -247,12 +259,19 @@ class PiadDataset(Dataset):
         affordance_id = self.aff_to_idx[affordance]
 
         if self.use_sam_features:
-            # Load pre-extracted SAM feature
+            # Load pre-extracted SAM cache entry
             image_path = self._sample_image_path(obj_class.lower(), affordance)
             sam_feature = self.sam_features.get(image_path)
-            if sam_feature is None:
-                # Fallback: return zeros if SAM feature not found
-                sam_feature = torch.zeros(256, 14, 14)  # Default size for 224x224 images
+            if self.sam_mode == "masked_rgb":
+                # Masked foreground RGB [3,H,W] uint8 -> normalized float for DINOv2
+                if sam_feature is None:
+                    sam_feature = torch.zeros(3, self.img_size, self.img_size)
+                else:
+                    sam_feature = self.sam_normalize(sam_feature.float() / 255.0)
+            else:
+                # 256-d SAM image embedding [256,H/16,W/16]
+                if sam_feature is None:
+                    sam_feature = torch.zeros(256, 14, 14)  # Default size for 224x224 images
             return point_input, class_id, binary_mask, questions, affordance_id, gt_mask, sam_feature
         
         if self.use_image:

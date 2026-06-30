@@ -53,3 +53,16 @@ dataset:
   use_image: false
   use_sam: true
   img_size: 224
+  # SAM teacher input when use_image + pre-extracted cache are enabled:
+  #   masked_rgb (default): SAM-segmented foreground RGB fed to the trained DINOv2 path
+  #   feature:              256-d SAM image embeddings fed to sam_proj
+  sam_mode: masked_rgb
+  # Directory of the pre-extracted SAM cache (defaults to <data_root>/sam_features)
+  sam_feature_dir: null
+
+# Offline SAM preprocessing (dataset/preprocess_sam.py)
+sam:
+  mode: masked_rgb            # must match dataset.sam_mode
+  checkpoint: sam_vit_h_4b8939.pth
+  model_type: vit_h
+  img_size: 224

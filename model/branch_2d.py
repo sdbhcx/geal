@@ -103,6 +103,18 @@ class Branch2D(nn.Module):
         )
         self.cls_norm = nn.LayerNorm(self.llm_dim)
 
+        # ====== SAM-feature projection head ======
+        # Used only when the interaction-image teacher is fed pre-extracted
+        # 256-d SAM image embeddings instead of a masked RGB image. Defined here
+        # (not lazily inside forward) so that its parameters are registered
+        # before build_optimizer() runs and are therefore actually trained.
+        self.sam_feat_dim = cfg.get("sam_feat_dim", 256)
+        self.sam_proj = nn.Sequential(
+            nn.Linear(self.sam_feat_dim, self.llm_dim),
+            nn.GELU(),
+            nn.Linear(self.llm_dim, self.llm_dim)
+        )
+
         # ====== Decoder and positional encoding ======
         decoder_layer = TransformerDecoderLayer(self.llm_dim, nheads=self.num_heads, dropout=0)
         self.decoder = TransformerDecoder(decoder_layer, num_layers=1, norm=nn.LayerNorm(self.llm_dim))
@@ -252,20 +264,13 @@ class Branch2D(nn.Module):
 
     def _encode_image_tokens(self, image):
         """Extract features from real interaction image or SAM features -> [B, P, llm_dim]."""
-        # Check if input is SAM features (256 channels) or RGB image (3 channels)
-        if image.shape[1] == 256:
-            # Input is SAM features [B, 256, H, W]
-            B, C, H, W = image.shape
-            # Flatten spatial dimensions to sequence [B, P, 256] where P = H * W
-            sam_feat = image.flatten(2).transpose(1, 2)  # [B, H*W, 256]
-            # Project SAM features to llm_dim
-            # Create projection layer if not exists
-            if not hasattr(self, 'sam_proj'):
-                self.sam_proj = nn.Sequential(
-                    nn.Linear(256, self.llm_dim),
-                    nn.GELU(),
-                    nn.Linear(self.llm_dim, self.llm_dim)
-                ).to(image.device)
+        # Route by channel count: pre-extracted SAM embeddings (sam_feat_dim
+        # channels) go through sam_proj; a masked/raw RGB image (3 channels)
+        # goes through the trained DINOv2 + dino_embed path.
+        if image.shape[1] == self.sam_feat_dim:
+            # Input is SAM features [B, sam_feat_dim, H, W]
+            # Flatten spatial dimensions to sequence [B, P, sam_feat_dim] where P = H * W
+            sam_feat = image.flatten(2).transpose(1, 2)  # [B, H*W, sam_feat_dim]
             return self.sam_proj(sam_feat)  # [B, P, llm_dim]
         else:
             # Input is RGB image [B, 3, H, W], use DINOv2

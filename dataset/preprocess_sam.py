@@ -89,6 +89,55 @@ class SAMPREprocessor:
         features = self.predictor.get_image_embedding()  # [1, 256, H/16, W/16]
         return features.squeeze(0)
 
+    @torch.no_grad()
+    def extract_masked_rgb(self, image, bbox=None):
+        """
+        用SAM分割出前景物体，将背景置零后返回masked RGB图像。
+        这样喂给DINOv2的是「去掉背景噪声的物体RGB」，而不是SAM的256维分割嵌入，
+        从而复用已训练的DINOv2语义编码器作为teacher。
+
+        Args:
+            image: PIL.Image，原始RGB交互图像
+            bbox: 可选 [x_min, y_min, x_max, y_max]。提供时作为SAM的box prompt，
+                  分割更可靠，并裁剪到该区域以贴合物体。
+        Returns:
+            torch.Tensor: uint8 masked RGB，形状 [3, H, W]（H/W = self.img_size）。
+                          背景像素为0。归一化在数据集加载时进行。
+        """
+        if not isinstance(image, Image.Image):
+            raise TypeError("extract_masked_rgb expects a PIL.Image")
+        image_np = np.array(image.convert("RGB"))  # [H, W, 3] uint8
+        H, W = image_np.shape[:2]
+
+        self.predictor.set_image(image_np)
+
+        # 用bbox作为prompt分割前景；无bbox时退化为整图(全1掩码)
+        if bbox is not None:
+            x_min, y_min, x_max, y_max = bbox
+            x_min = max(0, int(x_min)); y_min = max(0, int(y_min))
+            x_max = min(W, int(x_max)); y_max = min(H, int(y_max))
+            box_arr = np.array([x_min, y_min, x_max, y_max])[None, :]
+            masks, scores, _ = self.predictor.predict(box=box_arr, multimask_output=False)
+            mask = masks[0].astype(bool)  # [H, W]
+        else:
+            x_min, y_min, x_max, y_max = 0, 0, W, H
+            mask = np.ones((H, W), dtype=bool)
+
+        # 背景置零
+        masked = image_np.copy()
+        masked[~mask] = 0
+
+        # 裁剪到bbox区域(贴合物体，去掉大片黑边)，若bbox非法则不裁剪
+        if x_max > x_min and y_max > y_min:
+            masked = masked[y_min:y_max, x_min:x_max]
+
+        masked_img = Image.fromarray(masked)
+        if self.img_size is not None:
+            masked_img = masked_img.resize(self.img_size, Image.Resampling.LANCZOS)
+
+        masked_np = np.array(masked_img)  # [h, w, 3] uint8
+        return torch.from_numpy(masked_np).permute(2, 0, 1).contiguous()  # [3, h, w] uint8
+
 
 def main(cfg_path="config/train_stage1.yaml"):
     cfg = read_yaml(cfg_path)
@@ -107,8 +156,14 @@ def main(cfg_path="config/train_stage1.yaml"):
     
     # 获取图像尺寸配置，用于统一特征尺寸
     img_size = sam_cfg.get("img_size", (224, 224))
+    if isinstance(img_size, int):
+        img_size = (img_size, img_size)
     print(f"[INFO] Resizing images to {img_size}")
-    
+
+    # 预处理模式: "masked_rgb"(默认) 用SAM mask扣前景后存RGB; "feature" 存256维SAM嵌入
+    mode = sam_cfg.get("mode", "masked_rgb")
+    print(f"[INFO] SAM preprocess mode: {mode}")
+
     # 初始化SAM处理器
     sam_processor = SAMPREprocessor(
         sam_checkpoint=sam_cfg.get("checkpoint", "sam_vit_h_4b8939.pth"),
@@ -116,22 +171,22 @@ def main(cfg_path="config/train_stage1.yaml"):
         device=device,
         img_size=img_size
     )
-    
+
     # 处理PIAD数据集的2D交互图像
     if dataset_cfg["category"] == "piad":
         # 处理训练集
-        train_img_index_path = os.path.join(dataset_cfg["data_root"], 
+        train_img_index_path = os.path.join(dataset_cfg["data_root"],
             f"{dataset_cfg['setting']}_train_img_index.pkl")
         process_piad_images(train_img_index_path, sam_processor, sam_feature_dir, "train",
-                           data_root=dataset_cfg["data_root"], setting=dataset_cfg["setting"])
-        
+                           data_root=dataset_cfg["data_root"], setting=dataset_cfg["setting"], mode=mode)
+
         # 处理测试集
-        test_img_index_path = os.path.join(dataset_cfg["data_root"], 
+        test_img_index_path = os.path.join(dataset_cfg["data_root"],
             f"{dataset_cfg['setting']}_test_img_index.pkl")
         process_piad_images(test_img_index_path, sam_processor, sam_feature_dir, "test",
-                           data_root=dataset_cfg["data_root"], setting=dataset_cfg["setting"])
-    
-    print(f"[INFO] SAM feature extraction complete!")
+                           data_root=dataset_cfg["data_root"], setting=dataset_cfg["setting"], mode=mode)
+
+    print(f"[INFO] SAM preprocessing complete!")
 
 
 def load_bounding_boxes(data_root, setting, split):
@@ -242,8 +297,13 @@ def find_bbox_for_image(img_path, bbox_index):
     return None
 
 
-def process_piad_images(img_index_path, sam_processor, output_dir, split_name, data_root=None, setting=None):
-    """处理PIAD数据集的2D交互图像，提取SAM特征"""
+def process_piad_images(img_index_path, sam_processor, output_dir, split_name, data_root=None, setting=None,
+                        mode="masked_rgb"):
+    """处理PIAD数据集的2D交互图像。
+
+    mode="masked_rgb": 用SAM分割扣掉背景，保存masked RGB图像 [3,H,W] uint8。
+    mode="feature":    保存SAM的256维图像嵌入 [256,H/16,W/16]（旧行为）。
+    """
     # 加载图像索引文件
     if not os.path.exists(img_index_path):
         print(f"[WARN] Image index file not found: {img_index_path}")
@@ -278,21 +338,23 @@ def process_piad_images(img_index_path, sam_processor, output_dir, split_name, d
             
             # 获取对应的Bounding_Box（如果存在）
             bbox = find_bbox_for_image(img_path, bbox_index)
-            
-            # 提取SAM特征（使用Bounding_Box裁剪）
-            sam_feat = sam_processor.extract_features(image, bbox)
-            
-            # 保存到映射字典
-            img_to_feature[img_path] = sam_feat
-            
+
+            # 按模式提取（均使用Bounding_Box）
+            if mode == "masked_rgb":
+                img_to_feature[img_path] = sam_processor.extract_masked_rgb(image, bbox)
+            else:
+                img_to_feature[img_path] = sam_processor.extract_features(image, bbox)
+
         except Exception as e:
             print(f"[ERROR] Failed to process {img_path}: {e}")
             continue
-    
-    # 保存特征映射
-    save_path = os.path.join(output_dir, f"{split_name}_sam_features_dict.pt")
+
+    # 保存映射；不同模式存到不同文件，避免互相覆盖
+    fname = f"{split_name}_sam_masked_rgb_dict.pt" if mode == "masked_rgb" \
+        else f"{split_name}_sam_features_dict.pt"
+    save_path = os.path.join(output_dir, fname)
     torch.save(img_to_feature, save_path)
-    print(f"[INFO] Saved {len(img_to_feature)} SAM features to {save_path}")
+    print(f"[INFO] Saved {len(img_to_feature)} SAM {mode} entries to {save_path}")
 
 
 if __name__ == "__main__":

@@ -55,8 +55,12 @@ def build_dataloader(cfg):
         use_image = cfg.get("use_image", False)
         use_sam = cfg.get("use_sam", False)
         img_size = cfg.get("img_size", 224)
+        sam_mode = cfg.get("sam_mode", "masked_rgb")
+        sam_feature_dir = cfg.get("sam_feature_dir", None)
         train_dataset = PiadDataset(cfg["train_split"], cfg["setting"], data_root=cfg["data_root"],
-                                    use_image=use_image, img_size=img_size, use_sam=use_sam, use_sam_features=True)
+                                    use_image=use_image, img_size=img_size, use_sam=use_sam,
+                                    use_sam_features=True, sam_feature_dir=sam_feature_dir,
+                                    sam_mode=sam_mode)
         test_dataset = PiadDataset(cfg["test_split"], data_root=cfg["data_root"])
     elif cfg["category"] == "laso":
         train_dataset = LasoDataset(cfg["train_split"], cfg["setting"], data_root=cfg["data_root"])

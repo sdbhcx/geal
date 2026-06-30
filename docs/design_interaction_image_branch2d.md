@@ -125,3 +125,55 @@ L += λ_img · BCE(upsample(attn_img), contact_mask)
 3. 决策点:`z_img` 是否先 SAM 抠物体。
 4. 实现 Phase 1(图支路 + InfoNCE + config 开关),Stage 1 跑通,对比 IOU/SIM/MAE。
 5. 视效果决定是否上 Phase 2(接触伪标签监督)。
+
+---
+
+## 8. SAM teacher 实现与修订(2026-06,已落地)
+
+### 8.1 背景:第一版 SAM 尝试为何无效
+
+第一版把 SAM 的 **256 维图像嵌入**(`predictor.get_image_embedding()`,`[256,H/16,W/16]`)直接当 teacher 输入,经 `sam_proj` 投影到 `llm_dim`。日志对比(last-10-epoch 均值,与 §6(a) 的预期相反)显示 SAM ≈ 无SAM、甚至略差,根因有二:
+
+1. **`sam_proj` 从未被训练(bug)**。它在 `forward` 里惰性创建(`if not hasattr(self,'sam_proj')`),而 `build_optimizer()` 早已在第一次 forward **之前**锁定参数组 → `sam_proj` 进不了 optimizer,恒为随机初始化。叠加 teacher 侧 `z_img.detach()`,该投影**两头都拿不到梯度**,teacher 退化成「SAM 特征过一个随机固定线性层」的噪声目标。
+2. **SAM 嵌入是错的特征类型**。`get_image_embedding()` 面向可提示分割(物体边界/可分割性),不是语义 affordance 线索;而渲染支路 teacher 需要的是 DINOv2 那种语义表征。
+
+### 8.2 修订一:`sam_proj` 注册到 `__init__`
+
+`model/branch_2d.py`:`sam_proj` 移入 `__init__`(维度取 `cfg.sam_feat_dim`,默认 256),在 `build_optimizer()` 前注册为子模块 → 真正进 optimizer。`_encode_image_tokens` 的路由判据改为 `image.shape[1] == self.sam_feat_dim`。
+
+### 8.3 修订二:SAM mask 抠前景 → masked RGB → DINO(默认路径)
+
+落实 §6(a)。不再喂 256 维嵌入,而是**用 SAM 把前景物体抠出来、背景置零,得到 masked RGB**,3 通道天然走已训练的 **DINOv2 + `dino_embed`** 路径——`dino_embed`/`dino_embed_norm` 本就被渲染支路 BCE 训练(§2 Step 2 共享),所以 teacher 用的是**已训练的语义编码器**,既绕开 8.1 的死结,又去掉了背景/人物噪声。
+
+```
+交互图 ─► SAM(bbox 作 box prompt)分割前景 ─► 背景置零 + 裁剪到 bbox + resize
+       ─► masked RGB [3,224,224] (uint8, 离线缓存)
+训练时加载 ─► /255 + ImageNet 归一化 ─► frozen DINOv2 ─► dino_embed(已训练) ─► img_feat[B,256,512]
+```
+
+- 用 **bbox 作 prompt**(数据集 `Bounding_Box/` 已有)比自动分割更可靠;无 bbox 时回退整图。
+- 离线缓存,避免训练时实时跑 SAM。两种模式存到不同文件,互不覆盖。
+
+### 8.4 代码落点
+
+| 改动 | 文件 | 内容 |
+|---|---|---|
+| 修 bug | `model/branch_2d.py` | `sam_proj` 移入 `__init__`(`sam_feat_dim`);路由判据改 `== self.sam_feat_dim` |
+| 抠前景 | `dataset/preprocess_sam.py` | 新增 `extract_masked_rgb(image, bbox)`;`sam.mode` 选 `masked_rgb`/`feature`;存 `{split}_sam_masked_rgb_dict.pt` |
+| 加载 | `dataset/piad.py` | 新增 `sam_mode`;`masked_rgb` 下加载 uint8 RGB 并归一化为 `[3,H,W]` |
+| 开关 | `config/train_stage1.yaml` + `scripts/train_stage1.py` | `dataset.sam_mode`、`dataset.sam_feature_dir`、`sam:` 预处理块 |
+
+### 8.5 运行步骤
+
+masked RGB 与旧 256-d 缓存格式不同,训练前需**重跑预处理**:
+
+```bash
+python3 dataset/preprocess_sam.py --config config/train_stage1.yaml   # 默认 mode=masked_rgb
+```
+
+生成 `<data_root>/sam_features/{train,test}_sam_masked_rgb_dict.pt` 后,确保 `dataset.category: piad`、`use_image: true`、`sam_mode: masked_rgb`,即可启动 Stage 1。
+
+### 8.6 仍待验证
+
+- masked RGB(本方案)vs 256-d 特征(已修 `sam_proj`)vs 无SAM RGB,三者 IOU/AUC/SIM/MAE 对比。
+- 评估时建议报告 last-N epoch 均值±std 或多 seed:上一轮 SAM 与无SAM 的差异落在 run 间噪声(IOU std≈0.002–0.003)以内,单 epoch 快照会得出错误结论。

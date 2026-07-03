@@ -11,6 +11,7 @@ train:
   pretrained_2d: runs/train/geal_stage1/best_model_geal_stage1_PIAD.pt
   gpu: 1
   kl_loss_weight: 0.1
+  render_consistency_weight: 0.5
 
 optimizer:
   lr: 1e-4

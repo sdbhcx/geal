@@ -22,7 +22,7 @@ from dataset.laso import LasoDataset
 from dataset.piad import PiadDataset
 from model.branch_2d import Branch2D
 from model.branch_3d import Branch3D
-from utils.loss import HM_Loss
+from utils.loss import HM_Loss, l1_loss
 
 # ---------------------------------------------------------------------
 # Helper Functions
@@ -104,20 +104,26 @@ def train_one_epoch(model_3d, model_2d, loader, optimizer, device, criterion_hm,
         point, label = point.to(device), label.to(device)
 
         # --- Forward ---
-        pred_3d, feat_3d = model_3d(question, point)
-        feat_2d, render_feats = model_2d(question, point, feat_3d)
+        pred_3d, feat_3d, gaussian_aff = model_3d(question, point)
+        feat_2d, render_feats, aff_render, aff_teacher, mask = model_2d(question, point, feat_3d, gaussian_aff)
 
         # --- Losses ---
         loss_kld = nn.MSELoss()(render_feats, feat_2d)
         loss_hm = criterion_hm(pred_3d, label)
-        loss = loss_hm + train_cfg["kl_loss_weight"]*loss_kld
+        # Prediction-level 3D->2D render consistency (masked to foreground)
+        loss_render = l1_loss(aff_render, aff_teacher.detach(), mask)
+        loss = loss_hm + train_cfg["kl_loss_weight"]*loss_kld \
+            + train_cfg["render_consistency_weight"]*loss_render
 
         loss.backward()
         optimizer.step()
         loss_sum += loss.item()
 
         if i % 10 == 0:
-            logger.debug(f"[Epoch {epoch}] Iter {i}/{len(loader)} | Loss: {loss.item():.4f}")
+            logger.debug(
+                f"[Epoch {epoch}] Iter {i}/{len(loader)} | Loss: {loss.item():.4f} "
+                f"(hm: {loss_hm.item():.4f}, kld: {loss_kld.item():.4f}, render: {loss_render.item():.4f})"
+            )
 
     return loss_sum / len(loader)
 

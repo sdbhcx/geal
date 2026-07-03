@@ -107,6 +107,15 @@ class Branch3D(nn.Module):
         if self.training:
             self.feature_downsampler = PointFeatureDownsampler(self.emb_dim, self.project_dim)
 
+            # Per-Gaussian affordance head: predicts a scalar affordance per point,
+            # rendered to 2D and aligned with the frozen 2D branch heatmap
+            # (prediction-level 3D->2D consistency). Training-only; discarded at eval.
+            self.gaussian_aff_head = nn.Sequential(
+                nn.Conv1d(self.emb_dim, self.emb_dim // 4, 1),
+                nn.ReLU(inplace=True),
+                nn.Conv1d(self.emb_dim // 4, 1, 1),
+            )
+
         self.pool = nn.AdaptiveAvgPool1d(1)
 
     # ----------------------------------------------------------------------
@@ -177,7 +186,11 @@ class Branch3D(nn.Module):
         if self.training:
             downsampled_feat = self.feature_downsampler(fused_feat)  # [B, 512, 2048] → [B, 64, 2048]
             downsampled_feat = downsampled_feat.transpose(1, 2)      # [B, 2048, 64]
-            return affordance_map, downsampled_feat
+
+            # Per-Gaussian affordance scalar for 3D->2D render consistency [B, N]
+            gaussian_aff = torch.sigmoid(self.gaussian_aff_head(fused_feat)).squeeze(1)
+
+            return affordance_map, downsampled_feat, gaussian_aff
         else:
             return affordance_map
         

@@ -90,7 +90,7 @@ class SAMPREprocessor:
         return features.squeeze(0)
 
     @torch.no_grad()
-    def extract_masked_rgb(self, image, bbox=None):
+    def extract_masked_rgb(self, image, bbox=None, return_bg=False):
         """
         用SAM分割出前景物体，将背景置零后返回masked RGB图像。
         这样喂给DINOv2的是「去掉背景噪声的物体RGB」，而不是SAM的256维分割嵌入，
@@ -100,9 +100,11 @@ class SAMPREprocessor:
             image: PIL.Image，原始RGB交互图像
             bbox: 可选 [x_min, y_min, x_max, y_max]。提供时作为SAM的box prompt，
                   分割更可靠，并裁剪到该区域以贴合物体。
+            return_bg: 是否同时返回背景图像（用于对比学习中的负样本）
         Returns:
             torch.Tensor: uint8 masked RGB，形状 [3, H, W]（H/W = self.img_size）。
                           背景像素为0。归一化在数据集加载时进行。
+            (可选) torch.Tensor: uint8背景图像，形状 [3, H, W]。前景像素为0。
         """
         if not isinstance(image, Image.Image):
             raise TypeError("extract_masked_rgb expects a PIL.Image")
@@ -123,20 +125,40 @@ class SAMPREprocessor:
             x_min, y_min, x_max, y_max = 0, 0, W, H
             mask = np.ones((H, W), dtype=bool)
 
-        # 背景置零
-        masked = image_np.copy()
-        masked[~mask] = 0
+        # 前景图像：背景置零
+        fg_masked = image_np.copy()
+        fg_masked[~mask] = 0
 
         # 裁剪到bbox区域(贴合物体，去掉大片黑边)，若bbox非法则不裁剪
         if x_max > x_min and y_max > y_min:
-            masked = masked[y_min:y_max, x_min:x_max]
+            fg_masked = fg_masked[y_min:y_max, x_min:x_max]
 
-        masked_img = Image.fromarray(masked)
+        fg_img = Image.fromarray(fg_masked)
         if self.img_size is not None:
-            masked_img = masked_img.resize(self.img_size, Image.Resampling.LANCZOS)
+            fg_img = fg_img.resize(self.img_size, Image.Resampling.LANCZOS)
 
-        masked_np = np.array(masked_img)  # [h, w, 3] uint8
-        return torch.from_numpy(masked_np).permute(2, 0, 1).contiguous()  # [3, h, w] uint8
+        fg_np = np.array(fg_img)  # [h, w, 3] uint8
+        fg_tensor = torch.from_numpy(fg_np).permute(2, 0, 1).contiguous()  # [3, h, w] uint8
+
+        # 如果需要返回背景
+        if return_bg:
+            # 背景图像：前景置零
+            bg_masked = image_np.copy()
+            bg_masked[mask] = 0
+            
+            # 同样裁剪到bbox区域
+            if x_max > x_min and y_max > y_min:
+                bg_masked = bg_masked[y_min:y_max, x_min:x_max]
+
+            bg_img = Image.fromarray(bg_masked)
+            if self.img_size is not None:
+                bg_img = bg_img.resize(self.img_size, Image.Resampling.LANCZOS)
+
+            bg_np = np.array(bg_img)  # [h, w, 3] uint8
+            bg_tensor = torch.from_numpy(bg_np).permute(2, 0, 1).contiguous()  # [3, h, w] uint8
+            return fg_tensor, bg_tensor
+
+        return fg_tensor
 
 
 def main(cfg_path="config/train_stage1.yaml"):
@@ -303,6 +325,7 @@ def process_piad_images(img_index_path, sam_processor, output_dir, split_name, d
 
     mode="masked_rgb": 用SAM分割扣掉背景，保存masked RGB图像 [3,H,W] uint8。
     mode="feature":    保存SAM的256维图像嵌入 [256,H/16,W/16]（旧行为）。
+    mode="fg_bg":      同时保存前景和背景图像，用于对比学习。返回字典包含 'fg' 和 'bg' 键。
     """
     # 加载图像索引文件
     if not os.path.exists(img_index_path):
@@ -342,6 +365,10 @@ def process_piad_images(img_index_path, sam_processor, output_dir, split_name, d
             # 按模式提取（均使用Bounding_Box）
             if mode == "masked_rgb":
                 img_to_feature[img_path] = sam_processor.extract_masked_rgb(image, bbox)
+            elif mode == "fg_bg":
+                # 同时提取前景和背景
+                fg_tensor, bg_tensor = sam_processor.extract_masked_rgb(image, bbox, return_bg=True)
+                img_to_feature[img_path] = {'fg': fg_tensor, 'bg': bg_tensor}
             else:
                 img_to_feature[img_path] = sam_processor.extract_features(image, bbox)
 
@@ -350,8 +377,13 @@ def process_piad_images(img_index_path, sam_processor, output_dir, split_name, d
             continue
 
     # 保存映射；不同模式存到不同文件，避免互相覆盖
-    fname = f"{split_name}_sam_masked_rgb_dict.pt" if mode == "masked_rgb" \
-        else f"{split_name}_sam_features_dict.pt"
+    if mode == "masked_rgb":
+        fname = f"{split_name}_sam_masked_rgb_dict.pt"
+    elif mode == "fg_bg":
+        fname = f"{split_name}_sam_fg_bg_dict.pt"
+    else:
+        fname = f"{split_name}_sam_features_dict.pt"
+    
     save_path = os.path.join(output_dir, fname)
     torch.save(img_to_feature, save_path)
     print(f"[INFO] Saved {len(img_to_feature)} SAM {mode} entries to {save_path}")

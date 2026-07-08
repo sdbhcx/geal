@@ -135,21 +135,63 @@ def cal_kl_loss(fmap1, fmap2):
     return kl_loss
 
 
-def info_nce(query, key, temp=0.07):
+def info_nce(query, key, bg_feat=None, temp=0.07, bg_weight=1.0, bg_strategy='concat'):
     """
     Symmetric-by-row InfoNCE between two sets of region-level affordance
     embeddings. Row i of `query` (rendered-view, student) should match row i of
     `key` (interaction-image, teacher) more than any other row in the batch.
 
+    Supports background features as additional negative samples for enhanced contrastive learning.
+
     Args:
         query: [B, C] student embeddings (gradient flows here).
         key:   [B, C] teacher embeddings (detach before calling to freeze teacher).
-        temp:  softmax temperature.
+        bg_feat: [B, C] or [B, K, C] background feature embeddings as extra negatives.
+                 Should be detached before calling to freeze background.
+        temp:  softmax temperature (default: 0.07).
+        bg_weight: weight for background logits (default: 1.0).
+                   Use values > 1 to emphasize background contrast.
+        bg_strategy: 'concat' or 'separate'.
+                     - 'concat': background features are concatenated with key features
+                     - 'separate': background is treated as a separate loss term
     Returns:
         scalar contrastive loss.
     """
     q = F.normalize(query, dim=-1)
     k = F.normalize(key, dim=-1)
-    logits = q @ k.t() / temp                     # [B, B] cosine / temp
+    
+    # Compute foreground logits (same as original InfoNCE)
+    fg_logits = q @ k.t() / temp  # [B, B]
+    
+    if bg_feat is not None:
+        bg_feat = F.normalize(bg_feat, dim=-1)
+        
+        # Handle multi-sample background features [B, K, C]
+        if bg_feat.dim() == 3:
+            B, K, C = bg_feat.shape
+            bg_feat = bg_feat.flatten(0, 1)  # [B*K, C]
+        
+        # Compute background logits
+        bg_logits = (q @ bg_feat.t() / temp) * bg_weight  # [B, B] or [B, B*K]
+        
+        if bg_strategy == 'concat':
+            # Concatenate foreground and background logits
+            logits = torch.cat([fg_logits, bg_logits], dim=-1)  # [B, B + B*K]
+        else:
+            # Separate loss terms for foreground and background
+            # Foreground loss
+            fg_labels = torch.arange(q.size(0), device=q.device)
+            fg_loss = F.cross_entropy(fg_logits, fg_labels)
+            
+            # Background loss: query should not match background
+            # We use all background features as negative samples
+            bg_labels = torch.full((q.size(0),), bg_logits.size(-1), device=q.device)
+            bg_loss = F.cross_entropy(torch.cat([bg_logits, torch.zeros_like(bg_logits[:, :1])], dim=-1), 
+                                      bg_labels)
+            
+            return fg_loss + bg_weight * bg_loss
+    else:
+        logits = fg_logits
+    
     labels = torch.arange(q.size(0), device=q.device)
     return F.cross_entropy(logits, labels)

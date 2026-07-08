@@ -262,7 +262,12 @@ class PiadDataset(Dataset):
             # Load pre-extracted SAM cache entry
             image_path = self._sample_image_path(obj_class.lower(), affordance)
             sam_feature = self.sam_features.get(image_path)
-            if self.sam_mode == "masked_rgb":
+            if self.sam_mode == "fg_bg":
+                sam_feature = self.sam_features.get(image_path)
+                fg_tensor = self.sam_normalize(sam_feature['fg'].float() / 255.0)
+                bg_tensor = self.sam_normalize(sam_feature['bg'].float() / 255.0)
+                return point_input, class_id, binary_mask, questions, affordance_id, gt_mask, fg_tensor, bg_tensor
+            elif self.sam_mode == "masked_rgb":
                 # Masked foreground RGB [3,H,W] uint8 -> normalized float for DINOv2
                 if sam_feature is None:
                     sam_feature = torch.zeros(3, self.img_size, self.img_size)

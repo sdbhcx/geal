@@ -142,7 +142,7 @@ def train_one_epoch(model, loader, optimizer, device, renderer, logger, epoch,
             print(f"iter{i}  alloc={alloc:.2f}G reserved={reserved:.2f}G peak={peak:.2f}G", flush=True)
         # 训练集使用预提取的SAM特征，始终返回7个字段
         # 第7个字段是SAM特征 [256, H/16, W/16]
-        point, _, _, question, _, label, sam_feature = batch
+        point, _, _, question, _, label, sam_feature, bg_features = batch
         image = sam_feature.to(device) if use_image else None
 
         optimizer.zero_grad()
@@ -181,7 +181,7 @@ def train_one_epoch(model, loader, optimizer, device, renderer, logger, epoch,
 
         loss = nn.BCELoss()(pred, gray_images)
         if use_image:
-            loss_align = info_nce(z_render, z_img.detach(), temp=temp)
+            loss_align = info_nce(z_render, z_img.detach(), bg_feat=bg_features.detach(), temp=temp)
             loss = loss + align_weight * loss_align
         ck(f"iter{i}: loss")
 

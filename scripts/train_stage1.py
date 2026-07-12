@@ -174,14 +174,15 @@ def train_one_epoch(model, loader, optimizer, device, renderer, logger, epoch,
         ck(f"iter{i}: GT渲染")
 
         if use_image:
-            pred, z_render, z_img = model(question, point, image=image)
+            bg_image = bg_features.to(device)
+            pred, z_render, z_img, z_bg = model(question, point, image=image, bg_image=bg_image)
         else:
             pred = model(question, point)
         ck(f"iter{i}: 模型前向")
 
         loss = nn.BCELoss()(pred, gray_images)
         if use_image:
-            loss_align = info_nce(z_render, z_img.detach(), bg_feat=bg_features.detach(), temp=temp)
+            loss_align = info_nce(z_render, z_img.detach(), bg_feat=z_bg, temp=temp)
             loss = loss + align_weight * loss_align
         ck(f"iter{i}: loss")
 

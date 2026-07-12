@@ -129,7 +129,7 @@ class Branch2D(nn.Module):
 
     # ----------------------------------------------------------------------
 
-    def forward(self, text, xyz, features_3d=None, affordance_3d=None, image=None):
+    def forward(self, text, xyz, features_3d=None, affordance_3d=None, image=None, bg_image=None):
         """
         Forward pass for the 2D branch.
         Args:
@@ -143,17 +143,22 @@ class Branch2D(nn.Module):
             image (Tensor): Optional real interaction image [B, 3, H, W]. When given
                 in stage 1, the branch also returns region-level affordance embeddings
                 (z_render, z_img) for the InfoNCE knowledge-injection loss.
+            bg_image (Tensor): Optional background image [B, 3, H, W]. When given
+                together with image in stage 1, also returns z_bg [B, C] encoded via
+                DINOv2 for use as negative samples in the InfoNCE loss.
 
         Returns:
             Tensor: 2D affordance maps of shape [B*n_view, 1, H, W].
             (when image is not None and stage1) tuple (attn_map, z_render, z_img).
+            (when bg_image is also given) tuple (attn_map, z_render, z_img, z_bg).
             (stage 2) tuple (fused_features, render_feats) or, when affordance_3d is
             given, (fused_features, render_feats, aff_render, aff_teacher, masks).
         """
         B = xyz.shape[0]
 
         # ========== Step 1. Differentiable Rendering ==========
-        rendered_images, masks, render_feats, aff_render = self._render_views(xyz, features_3d, affordance_3d)
+        rendered_images, masks, render_feats, aff_render, alpha_tensor, idx_tensor, contrib_tensor = \
+            self._render_views(xyz, features_3d, affordance_3d)
         Bn, C, H, W = rendered_images.shape
 
         # ========== Step 2. Extract DINOv2 Features ==========
@@ -211,6 +216,12 @@ class Branch2D(nn.Module):
             img_feat = self._encode_image_tokens(image)                  # [B, P, C]
             z_img, _ = self._image_affordance(text_img, text_mask_img, img_feat)
 
+            if bg_image is not None:
+                with torch.no_grad():
+                    bg_feat = self._encode_image_tokens(bg_image)        # [B, P, C]
+                    z_bg = bg_feat.mean(dim=1)                           # [B, C]
+                return attn_map, z_render, z_img, z_bg
+
             return attn_map, z_render, z_img
 
         else:
@@ -219,13 +230,13 @@ class Branch2D(nn.Module):
             fused_features = self.feature_upsampler(dense_feat_map)
 
             if aff_render is None:
-                return fused_features, render_feats
+                return fused_features, render_feats, alpha_tensor, idx_tensor, contrib_tensor
 
             # Prediction-level 3D->2D consistency: the frozen 2D branch's own
             # affordance heatmap serves as teacher for the splatted 3D affordance.
             aff_teacher, _ = self._affordance_heatmap(
                 text_embeds, text_mask, cross_modal_feat, fused_feat, cls_token, Bn, H, W)
-            return fused_features, render_feats, aff_render, aff_teacher, masks
+            return fused_features, render_feats, alpha_tensor, idx_tensor, contrib_tensor, aff_render, aff_teacher, masks
 
     # ----------------------------------------------------------------------
 
@@ -239,6 +250,7 @@ class Branch2D(nn.Module):
         to per-Gaussian inputs) and reading channel 0 back out.
         """
         rendered_images, masks, feats, aff_maps = [], [], [], []
+        idxs, contribs, alphas = [], [], []
 
         # If no 3D features provided, create iterable of Nones
         if features_3d is None:
@@ -247,7 +259,7 @@ class Branch2D(nn.Module):
             affordance_3d = [None] * xyz.shape[0]
 
         for pts, f3d, aff in zip(xyz, features_3d, affordance_3d):
-            rgb_img, depth_img, _, _, feat = self.renderer(pts, None, f3d)
+            rgb_img, depth_img, render_idx, rendered_contrib, feat, alpha = self.renderer(pts, None, f3d)
             depth_vis = depth_to_rgb(depth_img)
             mask = (rgb_img != 0).all(dim=1, keepdim=True).int()
             norm_img = TF.normalize(depth_vis, mean=self.normalize_mean, std=self.normalize_std)
@@ -255,12 +267,15 @@ class Branch2D(nn.Module):
             rendered_images.append(norm_img)
             masks.append(mask)
             feats.append(feat)
+            idxs.append(render_idx)       # [V, n_contrib, H, W]
+            contribs.append(rendered_contrib)  # [V, n_contrib, H, W]
+            alphas.append(alpha)          # [V, 1, H, W]
 
             if aff is not None:
                 # Broadcast per-point scalar into the 64-d language-feature channels;
                 # all channels identical, so channel 0 == the rendered affordance.
                 aff64 = aff.reshape(-1, 1).repeat(1, self.project_dim)
-                _, _, _, _, aff_feat = self.renderer(pts, None, aff64)
+                _, _, _, _, aff_feat, _ = self.renderer(pts, None, aff64)
                 aff_maps.append(aff_feat[:, :1])           # [n_views, 1, H, W]
 
         render_tensor = torch.stack(rendered_images)       # [B, n_views, 3, H, W]
@@ -272,11 +287,16 @@ class Branch2D(nn.Module):
         mask_tensor = mask_tensor.view(-1, 1, H, W)
         feat_tensor = feat_tensor.view(-1, self.project_dim, H, W)
 
+        # Stack auxiliary tensors for A1/A2 losses
+        idx_tensor    = torch.stack(idxs)     # [B, V, n_contrib, H, W]
+        contrib_tensor= torch.stack(contribs)  # [B, V, n_contrib, H, W]
+        alpha_tensor  = torch.stack(alphas).view(-1, 1, H, W)  # [B*V, 1, H, W]
+
         aff_tensor = None
         if aff_maps:
             aff_tensor = torch.stack(aff_maps).view(-1, 1, H, W)  # [B*n_views, 1, H, W]
 
-        return render_tensor, mask_tensor, feat_tensor, aff_tensor
+        return render_tensor, mask_tensor, feat_tensor, aff_tensor, alpha_tensor, idx_tensor, contrib_tensor
 
     # ----------------------------------------------------------------------
 

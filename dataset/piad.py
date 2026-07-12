@@ -182,8 +182,12 @@ class PiadDataset(Dataset):
             if self.use_sam_features:
                 if sam_feature_dir is None:
                     sam_feature_dir = os.path.join(data_root, "sam_features")
-                cache_name = f"{split}_sam_masked_rgb_dict.pt" if self.sam_mode == "masked_rgb" \
-                    else f"{split}_sam_features_dict.pt"
+                if self.sam_mode == "masked_rgb":
+                    cache_name = f"{split}_sam_masked_rgb_dict.pt"
+                elif self.sam_mode == "fg_bg":
+                    cache_name = f"{split}_sam_fg_bg_dict.pt"
+                else:
+                    cache_name = f"{split}_sam_features_dict.pt"
                 sam_feature_path = os.path.join(sam_feature_dir, cache_name)
                 self.sam_features = torch.load(sam_feature_path, map_location="cpu")
                 print(f"[PIAD] Loaded {len(self.sam_features)} pre-extracted SAM "

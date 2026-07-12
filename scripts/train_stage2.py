@@ -7,7 +7,6 @@ into the 3D branch, aligning multi-view 2D representations with 3D features.
 
 import os
 import torch
-import torch.nn as nn
 from torch.utils.data import DataLoader
 import numpy as np
 from sklearn.metrics import roc_auc_score
@@ -23,6 +22,7 @@ from dataset.piad import PiadDataset
 from model.branch_2d import Branch2D
 from model.branch_3d import Branch3D
 from utils.loss import HM_Loss, l1_loss
+from utils.align_loss import visibility_weighted_align, cross_view_consistency
 
 # ---------------------------------------------------------------------
 # Helper Functions
@@ -105,15 +105,31 @@ def train_one_epoch(model_3d, model_2d, loader, optimizer, device, criterion_hm,
 
         # --- Forward ---
         pred_3d, feat_3d, gaussian_aff = model_3d(question, point)
-        feat_2d, render_feats, aff_render, aff_teacher, mask = model_2d(question, point, feat_3d, gaussian_aff)
+        feat_2d, render_feats, alpha, idx, contrib, aff_render, aff_teacher, mask = \
+            model_2d(question, point, feat_3d, gaussian_aff)
 
         # --- Losses ---
-        loss_kld = nn.MSELoss()(render_feats, feat_2d)
+        B_cur = point.shape[0]
+        V = render_feats.shape[0] // B_cur
+        C_f, H_f, W_f = render_feats.shape[1], render_feats.shape[2], render_feats.shape[3]
+
+        # A1: visibility/contribution-weighted distillation (replaces global MSE)
+        contrib_a1 = contrib.sum(dim=2).view(-1, 1, H_f, W_f)  # [B*V, 1, H, W]
+        loss_align = visibility_weighted_align(
+            render_feats, feat_2d, alpha, contrib_a1,
+            gamma=train_cfg.get("vw_gamma", 1.0))
+
+        # A2: cross-view consistency
+        student_bv = render_feats.view(B_cur, V, C_f, H_f, W_f)
+        loss_cv = cross_view_consistency(student_bv, idx, contrib)
+
         loss_hm = criterion_hm(pred_3d, label)
         # Prediction-level 3D->2D render consistency (masked to foreground)
         loss_render = l1_loss(aff_render, aff_teacher.detach(), mask)
-        loss = loss_hm + train_cfg["kl_loss_weight"]*loss_kld \
-            + train_cfg["render_consistency_weight"]*loss_render
+        loss = loss_hm \
+            + train_cfg["align_loss_weight"] * loss_align \
+            + train_cfg["cv_loss_weight"] * loss_cv \
+            + train_cfg["render_consistency_weight"] * loss_render
 
         loss.backward()
         optimizer.step()
@@ -122,7 +138,8 @@ def train_one_epoch(model_3d, model_2d, loader, optimizer, device, criterion_hm,
         if i % 10 == 0:
             logger.debug(
                 f"[Epoch {epoch}] Iter {i}/{len(loader)} | Loss: {loss.item():.4f} "
-                f"(hm: {loss_hm.item():.4f}, kld: {loss_kld.item():.4f}, render: {loss_render.item():.4f})"
+                f"(hm: {loss_hm.item():.4f}, align: {loss_align.item():.4f}, "
+                f"cv: {loss_cv.item():.4f}, render: {loss_render.item():.4f})"
             )
 
     return loss_sum / len(loader)

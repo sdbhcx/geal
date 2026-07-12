@@ -96,5 +96,58 @@ def map_back(color_map, idx_map, contrib_map):
     # Normalize to get the final color for each point
     point_colors = point_colors_sum / (contribution_sums + 1e-8)
 
-
     return point_colors
+
+
+def map_back_feat(feat_map, idx_map, contrib_map, num_points=2048):
+    """
+    Backproject per-view 2D feature maps to 3D points via contribution-weighted scatter_add.
+
+    Args:
+        feat_map:    [B, V, C, H, W]  per-view rendered feature maps (student)
+        idx_map:     [B, V, n_contrib, H, W]  point indices per contributor per pixel
+        contrib_map: [B, V, n_contrib, H, W]  contribution weights
+
+    Returns:
+        feats_v: [B, V, N, C]  per-view per-point aggregated features
+        vis_v:   [B, V, N]     per-view per-point total contribution weight (visibility)
+    """
+    B, V, C, H, W = feat_map.shape
+    n_c = idx_map.shape[2]
+
+    feats_out = []
+    vis_out = []
+
+    for v in range(V):
+        feat_v    = feat_map[:, v]        # [B, C, H, W]
+        idx_v     = idx_map[:, v]         # [B, n_c, H, W]
+        contrib_v = contrib_map[:, v]     # [B, n_c, H, W]
+
+        # Expand feat to match n_c contributors: [B, n_c, C, H, W]
+        feat_exp = feat_v.unsqueeze(1).expand(-1, n_c, -1, -1, -1)
+
+        # Weight by contribution: [B, n_c, C, H, W]
+        weighted = feat_exp * contrib_v.unsqueeze(2)
+
+        # Flatten spatial and contributor dims: [B, n_c*H*W, C]
+        weighted_flat = weighted.permute(0, 1, 3, 4, 2).reshape(B, n_c * H * W, C)
+        idx_flat      = idx_v.reshape(B, n_c * H * W).long()
+        contrib_flat  = contrib_v.reshape(B, n_c * H * W)
+
+        # Scatter-add weighted features and contributions per point
+        feats_sum  = torch.zeros(B, num_points, C, device=feat_map.device)
+        contrib_sum = torch.zeros(B, num_points, device=feat_map.device)
+
+        idx_exp = idx_flat.unsqueeze(-1).expand(-1, -1, C)  # [B, n_c*H*W, C]
+        feats_sum.scatter_add_(1, idx_exp, weighted_flat)
+        contrib_sum.scatter_add_(1, idx_flat, contrib_flat)
+
+        # Normalize: [B, N, C]
+        feats_n = feats_sum / (contrib_sum.unsqueeze(-1) + 1e-8)
+
+        feats_out.append(feats_n)
+        vis_out.append(contrib_sum)
+
+    feats_v = torch.stack(feats_out, dim=1)  # [B, V, N, C]
+    vis_v   = torch.stack(vis_out,   dim=1)  # [B, V, N]
+    return feats_v, vis_v

@@ -97,7 +97,7 @@ class Gaussian_Renderer:
 
         # Prepare containers for multi-view outputs
         gt_image_list, depth_image_list = [], []
-        render_idx_list, rendered_contrib_list, feature_list = [], [], []
+        render_idx_list, rendered_contrib_list, feature_list, alpha_list = [], [], [], []
 
         # ----------------- 8 Horizontal Views -----------------
         for hor in self.hor_angles:
@@ -115,6 +115,7 @@ class Gaussian_Renderer:
             render_idx_list.append(out["rendered_idx"])
             rendered_contrib_list.append(out["rendered_contrib"])
             feature_list.append(out["language_feature_image"])
+            alpha_list.append(out["alpha"])
 
         # ----------------- 4 Vertical Views -----------------
         for ver in self.ver_angles:
@@ -131,6 +132,7 @@ class Gaussian_Renderer:
             render_idx_list.append(out["rendered_idx"])
             rendered_contrib_list.append(out["rendered_contrib"])
             feature_list.append(out["language_feature_image"])
+            alpha_list.append(out["alpha"])
 
         # Stack all 12 view results
         gt_image = torch.stack(gt_image_list, dim=0)
@@ -138,5 +140,6 @@ class Gaussian_Renderer:
         render_idx = torch.stack(render_idx_list, dim=0)
         rendered_contrib = torch.stack(rendered_contrib_list, dim=0)
         features = torch.stack(feature_list, dim=0)
+        alpha_image = torch.stack(alpha_list, dim=0)  # [12, 1, H, W]
 
-        return gt_image, depth_image, render_idx, rendered_contrib, features
+        return gt_image, depth_image, render_idx, rendered_contrib, features, alpha_image

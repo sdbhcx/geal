@@ -124,7 +124,7 @@ class PiadDataset(Dataset):
     def __init__(self, split: str = "train", setting: str = "seen", data_root: str = "piad_dataset",
                  use_image: bool = False, img_size: int = 224, use_sam: bool = False,
                  use_sam_features: bool = False, sam_feature_dir: str = None,
-                 sam_mode: str = "masked_rgb"):
+                 sam_mode: str = "masked_rgb", k_images: int = 1):
         """
         Args:
             split (str): "train" or "test"
@@ -140,6 +140,9 @@ class PiadDataset(Dataset):
             sam_mode (str): which pre-extracted cache to use when use_sam_features is True.
                 "masked_rgb" (default): SAM-segmented foreground RGB [3,H,W], fed to DINOv2.
                 "feature": 256-d SAM image embeddings [256,H/16,W/16], fed to sam_proj.
+            k_images (int): number of interaction images to sample per (class, affordance) pair
+                when use_image is True. k_images=1 keeps the original single-image behavior
+                (returns [3,H,W]); k_images>1 returns a stacked tensor [k,3,H,W].
         """
         self.split = split
         self.setting = setting
@@ -149,6 +152,7 @@ class PiadDataset(Dataset):
         self.use_sam_features = use_sam_features
         self.sam_mode = sam_mode
         self.img_size = img_size
+        self.k_images = k_images
         # ImageNet normalization for masked RGB (matches the rendered-view branch)
         self.sam_normalize = T.Normalize(mean=[0.485, 0.456, 0.406],
                                          std=[0.229, 0.224, 0.225])
@@ -284,6 +288,14 @@ class PiadDataset(Dataset):
             return point_input, class_id, binary_mask, questions, affordance_id, gt_mask, sam_feature
         
         if self.use_image:
+            if self.k_images > 1:
+                # 采样 k 张同 (class, affordance) 交互图，返回 [k, 3, H, W]
+                imgs = torch.stack([
+                    self._load_and_transform(obj_class.lower(), affordance)
+                    for _ in range(self.k_images)
+                ])
+                return point_input, class_id, binary_mask, questions, affordance_id, gt_mask, imgs
+            # k_images == 1：保持原有单图行为
             image_pil = self._sample_image(obj_class.lower(), affordance)
             if self.use_sam:
                 image = self._apply_sam_segmentation(image_pil)
@@ -319,6 +331,18 @@ class PiadDataset(Dataset):
         """
         path = self._sample_image_path(obj_class, affordance)
         return Image.open(path).convert("RGB")  # Return PIL image for potential SAM processing
+
+    def _load_and_transform(self, obj_class: str, affordance: str) -> torch.Tensor:
+        """
+        Sample and transform one interaction image for the multi-image branch.
+        Internally calls _sample_image_path so a fresh random path is picked each call.
+
+        Returns:
+            Tensor: normalized image [3, img_size, img_size]
+        """
+        path = self._sample_image_path(obj_class, affordance)
+        image_pil = Image.open(path).convert("RGB")
+        return self.img_transform(image_pil)
     
     def _apply_sam_segmentation(self, image_pil):
         """

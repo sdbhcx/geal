@@ -2,16 +2,21 @@ train:
   seed: 42
   epochs: 50
   batch_size: 8
-  save_dir: runs/train/
+  save_dir: runs/train_img/
   name: geal_stage2
   storage: true
-  log_name: train_PIAD.log
+  log_name: train_multi_image.log
   resume: false
-  checkpoint_path: runs/train/geal_stage2/stage2_best.pt
-  pretrained_2d: runs/train/geal_stage1/best_model_geal_stage1_PIAD.pt
-  gpu: 1
-  kl_loss_weight: 0.1
-  render_consistency_weight: 0.5
+  checkpoint_path: runs/train_img/geal_stage2/best_model_geal_stage2_at_07.04_12.48.37.pt
+  pretrained_2d: runs/train_img/geal_stage1/best_model_geal_stage1_at_06.24_22.30.34.pt
+  gpu: 0
+  kl_loss_weight: 0.1        # kept for ckpt compatibility; superseded by align_loss_weight
+  align_loss_weight: 0.1    # A1: visibility/contribution-weighted distillation
+  cv_loss_weight: 0.05      # A2: cross-view consistency
+  vw_gamma: 1.0             # A1: exponent on contrib weight (0 = pure foreground mask)
+  render_consistency_weight: 0
+  sim_loss_weight: 0.1      # MIFAG: multi-image global cosine invariance loss
+  aff_loss_weight: 0.1      # CMAT: patch-level affinity matrix alignment loss
 
 optimizer:
   lr: 1e-4
@@ -43,6 +48,7 @@ model_3d:
   normal_channel: false
   num_heads: 4
   emb_dim: 512
+  llm_dim: 512         # 与 model_2d.llm_dim 对齐，用于 img_align_proj
   N_p: 64
   n_groups: 40
   project_dim: 64
@@ -98,3 +104,6 @@ dataset:
   num_workers: 8
   shuffle: true
   data_root: /home/datasets/PIAD_root
+  use_image: true      # 开启交互图像分支（MIFAG + CMAT 需要）
+  k_images: 3          # 每个样本采样的交互图张数
+  img_size: 224        # 图像分辨率，须为 14 的倍数

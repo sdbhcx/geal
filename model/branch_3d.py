@@ -48,6 +48,7 @@ class Branch3D(nn.Module):
         self.training = cfg["training"]
         self.num_levels = cfg["level"]
         self.fuse_level = cfg.get("fuse_level", False)
+        self.llm_dim = cfg.get("llm_dim", self.emb_dim)
 
         # ====== Text encoder (frozen or finetuned) ======
         self.text_encoder = AutoModel.from_pretrained(self.text_encoder_type)
@@ -115,6 +116,10 @@ class Branch3D(nn.Module):
                 nn.ReLU(inplace=True),
                 nn.Conv1d(self.emb_dim // 4, 1, 1),
             )
+
+            # CMAT patch-level affinity alignment: project 128-point features to
+            # the same dimension as the 2D DINOv2 patch tokens for affinity comparison.
+            self.img_align_proj = nn.Linear(self.emb_dim, self.llm_dim)
 
         self.pool = nn.AdaptiveAvgPool1d(1)
 
@@ -190,7 +195,12 @@ class Branch3D(nn.Module):
             # Per-Gaussian affordance scalar for 3D->2D render consistency [B, N]
             gaussian_aff = torch.sigmoid(self.gaussian_aff_head(fused_feat)).squeeze(1)
 
-            return affordance_map, downsampled_feat, gaussian_aff
+            # CMAT: 128-point mid-scale patch features projected to llm_dim for
+            # affinity-matrix alignment with the 2D branch DINOv2 patch tokens.
+            # feat_lvl2[1]: [B, emb_dim, 128] → transpose → [B, 128, emb_dim]
+            patch_feat_3d = self.img_align_proj(feat_lvl2[1].transpose(1, 2))  # [B, 128, llm_dim]
+
+            return affordance_map, downsampled_feat, gaussian_aff, patch_feat_3d
         else:
             return affordance_map
         

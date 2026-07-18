@@ -3,12 +3,12 @@ import itertools
 import torch
 import torch.nn as nn
 import torchvision.transforms.functional as TF
-from transformers import AutoModel, AutoTokenizer
 
 from model.attention import TransformerDecoder, TransformerDecoderLayer
 from model.fusion_block import GAFMBlock
 from model.layers import Mlp, SmallUpsampleNet, FeatureUpsampler
 from model.gaf_conv import GafConv
+from utils.clip_text_encoder import build_text_encoder
 from renderer.gaussian_render import Gaussian_Renderer
 from renderer.render_utils import depth_to_rgb
 
@@ -51,13 +51,8 @@ class Branch2D(nn.Module):
         self.render_resolution = render_cfg["render_resolution"]
         self.fuse_level = cfg.get("fuse_level", False)
 
-        # ====== Text encoder (frozen or fine-tuned) ======
-        self.text_encoder = AutoModel.from_pretrained(self.text_encoder_type)
-        self.tokenizer = AutoTokenizer.from_pretrained(self.text_encoder_type)
-        self.text_proj = nn.Sequential(
-            nn.Linear(self.text_encoder.config.hidden_size, self.emb_dim, bias=True),
-            nn.LayerNorm(self.emb_dim, eps=1e-12)
-        )
+        # ====== Text encoder (configurable via YAML) ======
+        self.text_encoder = self._build_text_encoder(cfg)
 
         # ====== Differentiable Gaussian Renderer ======
         self.renderer = Gaussian_Renderer(
@@ -365,22 +360,32 @@ class Branch2D(nn.Module):
 
     # ----------------------------------------------------------------------
 
+    @staticmethod
+    def _build_text_encoder(cfg):
+        """Build a TextEncoder from config, with backward compatibility."""
+        known_types = ("clip", "roberta")
+        enc_type = cfg["text_encoder_type"]
+        if enc_type.lower() in known_types:
+            enc_cfg = {
+                "type": enc_type,
+                "model_name": cfg.get("text_encoder_model", "openai/clip-vit-large-patch14"),
+                "emb_dim": cfg["emb_dim"],
+                "n_groups": cfg["n_groups"],
+                "freeze": cfg["freeze_text_encoder"],
+            }
+        else:
+            # Legacy format: text_encoder_type holds the model name/path
+            enc_cfg = {
+                "type": "clip",
+                "model_name": enc_type,
+                "emb_dim": cfg["emb_dim"],
+                "n_groups": cfg["n_groups"],
+                "freeze": cfg["freeze_text_encoder"],
+            }
+        return build_text_encoder(enc_cfg)
+
     def _encode_text(self, queries, device):
         """
-        Encode a list of natural language queries using pretrained text encoder.
+        Encode a list of natural language queries using CLIP.
         """
-        tokens = self.tokenizer.batch_encode_plus(
-            queries,
-            padding='max_length',
-            truncation=True,
-            max_length=self.n_groups,
-            return_tensors='pt'
-        ).to(device)
-
-        # Freeze text encoder if configured
-        with torch.inference_mode(mode=self.freeze_text_encoder):
-            encoded = self.text_encoder(**tokens).last_hidden_state
-
-        projected = self.text_proj(encoded)
-        attn_mask = tokens.attention_mask.bool()
-        return projected, attn_mask
+        return self.text_encoder.encode(queries, device)

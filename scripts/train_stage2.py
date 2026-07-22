@@ -43,13 +43,27 @@ def build_dataloader(cfg):
         use_image = cfg.get("use_image", False)
         k_images  = cfg.get("k_images", 1)
         img_size  = cfg.get("img_size", 224)
+        use_augmented = cfg.get("use_augmented", False)
+        n_aug_q = cfg.get("n_augmented_questions", 50)
+        use_func_desc = cfg.get("use_functional_desc", False)
+        func_desc_strat = cfg.get("func_desc_strategy", "prefix")
         train_dataset = PiadDataset(
             cfg["train_split"], cfg["setting"], data_root=cfg["data_root"],
             use_image=use_image, k_images=k_images, img_size=img_size,
+            use_augmented=use_augmented, n_augmented_questions=n_aug_q,
+            use_functional_desc=use_func_desc, func_desc_strategy=func_desc_strat,
         )
         test_dataset = PiadDataset(cfg["test_split"], data_root=cfg["data_root"])
     elif cfg["category"] == "laso":
-        train_dataset = LasoDataset(cfg["train_split"], cfg["setting"], data_root=cfg["data_root"])
+        use_augmented = cfg.get("use_augmented", False)
+        n_aug_q = cfg.get("n_augmented_questions", 50)
+        use_func_desc = cfg.get("use_functional_desc", False)
+        func_desc_strat = cfg.get("func_desc_strategy", "prefix")
+        train_dataset = LasoDataset(
+            cfg["train_split"], cfg["setting"], data_root=cfg["data_root"],
+            use_augmented=use_augmented, n_augmented_questions=n_aug_q,
+            use_functional_desc=use_func_desc, func_desc_strategy=func_desc_strat,
+        )
         test_dataset = LasoDataset(cfg["test_split"], data_root=cfg["data_root"])
 
     train_loader = DataLoader(

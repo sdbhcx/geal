@@ -124,7 +124,9 @@ class PiadDataset(Dataset):
     def __init__(self, split: str = "train", setting: str = "seen", data_root: str = "piad_dataset",
                  use_image: bool = False, img_size: int = 224, use_sam: bool = False,
                  use_sam_features: bool = False, sam_feature_dir: str = None,
-                 sam_mode: str = "masked_rgb", k_images: int = 1):
+                 sam_mode: str = "masked_rgb", k_images: int = 1,
+                 use_augmented: bool = False, n_augmented_questions: int = 50,
+                 use_functional_desc: bool = False, func_desc_strategy: str = "prefix"):
         """
         Args:
             split (str): "train" or "test"
@@ -153,6 +155,16 @@ class PiadDataset(Dataset):
         self.sam_mode = sam_mode
         self.img_size = img_size
         self.k_images = k_images
+
+        # ---- Text enhancement: augmented questions ----
+        self.use_augmented = use_augmented
+        self.n_augmented_questions = n_augmented_questions
+
+        # ---- Text enhancement: functional descriptions ----
+        self.use_functional_desc = use_functional_desc
+        self.func_desc_strategy = func_desc_strategy  # "prefix" or "suffix"
+        self.func_desc_map = {}
+
         # ImageNet normalization for masked RGB (matches the rendered-view branch)
         self.sam_normalize = T.Normalize(mean=[0.485, 0.456, 0.406],
                                          std=[0.229, 0.224, 0.225])
@@ -170,8 +182,33 @@ class PiadDataset(Dataset):
         with open(anno_path, "rb") as f:
             self.annotations = pickle.load(f)
 
-        # Load affordance rephrasing table
-        self.questions = pd.read_csv(os.path.join(data_root, "Affordance-Question.csv"))
+        # Load affordance rephrasing table (enhanced with augmented CSV if available)
+        base_csv = os.path.join(data_root, "Affordance-Question.csv")
+        if use_augmented:
+            aug_csv = os.path.join(data_root, "Affordance-Question-Augmented.csv")
+            if os.path.exists(aug_csv):
+                self.questions = pd.read_csv(aug_csv)
+                aug_cols = [c for c in self.questions.columns if c.startswith("Question")]
+                print(f"[PIAD] 加载增强版 CSV ({len(aug_cols)} 个问题列)")  # fmt: skip
+            else:
+                print(f"[WARN] 增强版 CSV 不存在 ({aug_csv}), 回退到原始版")
+                self.questions = pd.read_csv(base_csv)
+        else:
+            self.questions = pd.read_csv(base_csv)
+
+        # Load functional descriptions if enabled
+        if use_functional_desc:
+            desc_csv = os.path.join(data_root, "Affordance-Functional-Desc.csv")
+            if os.path.exists(desc_csv):
+                desc_df = pd.read_csv(desc_csv)
+                self.func_desc_map = {
+                    (row["Object"], row["Affordance"]): row["FunctionalDesc"]
+                    for _, row in desc_df.iterrows()
+                }
+                print(f"[PIAD] 加载 {len(self.func_desc_map)} 条功能性描述")
+            else:
+                print(f"[WARN] 功能描述 CSV 不存在 ({desc_csv}), 回退到无描述模式")
+                self.use_functional_desc = False
 
         # Optionally load the (class, affordance) -> [image paths] sidecar index
         self.img_index = None
@@ -211,7 +248,8 @@ class PiadDataset(Dataset):
     def _sample_question(self, object_name: str, affordance: str) -> str:
         """
         Retrieve one random rephrased question for an object-affordance pair.
-        Training randomly samples from 15 variants; test uses 'Question0'.
+        Training randomly samples from all available variants (augmented if enabled);
+        test uses 'Question0'.
 
         Args:
             object_name (str): object category name
@@ -219,13 +257,28 @@ class PiadDataset(Dataset):
         Returns:
             str: question text
         """
-        qid = f"Question{np.random.randint(1, 15)}" if self.split == "train" else "Question0"
+        if self.split == "train":
+            # Determine available question columns (base 15 + augmented if enabled)
+            all_cols = [f"Question{i}" for i in range(15)]
+            if self.use_augmented:
+                all_cols += [f"Question{i}" for i in range(15, 15 + self.n_augmented_questions)]
+            qid = np.random.choice(all_cols)
+        else:
+            qid = "Question0"
+
         row = self.questions.loc[
             (self.questions["Object"] == object_name) & (self.questions["Affordance"] == affordance),
             [qid]
         ]
-        if not row.empty:
+        if not row.empty and pd.notna(row.iloc[0][qid]):
             return row.iloc[0][qid]
+        # Fallback to Question0 (handles empty augmented columns)
+        row = self.questions.loc[
+            (self.questions["Object"] == object_name) & (self.questions["Affordance"] == affordance),
+            ["Question0"]
+        ]
+        if not row.empty:
+            return row.iloc[0]["Question0"]
         raise ValueError(f"No question found for {object_name}-{affordance}")
 
     # ------------------------------------------------------------------
@@ -254,6 +307,15 @@ class PiadDataset(Dataset):
 
         # Retrieve affordance question
         question = self._sample_question(obj_class, affordance)
+
+        # Inject functional description if enabled
+        if self.use_functional_desc:
+            func_desc = self.func_desc_map.get((obj_class, affordance), "")
+            if func_desc:
+                if self.func_desc_strategy == "prefix":
+                    question = f"{func_desc} {question}"
+                elif self.func_desc_strategy == "suffix":
+                    question = f"{question} {func_desc}"
 
         # Construct viewpoint-prefixed questions
         questions = tuple(

@@ -110,6 +110,21 @@ class Branch2D(nn.Module):
             nn.Linear(self.llm_dim, self.llm_dim)
         )
 
+        # ====== Affordance Projection Head (trainable) ======
+        # Conditional: only created when `use_affordance_proj` is enabled in config.
+        # Learns to map DINO visual features into an affordance semantic space.
+        # Output dim matches llm_dim so z_img can directly contrast with 3D
+        # patch_feat_3d (which is already projected to llm_dim).
+        self.use_affordance_proj = cfg.get("use_affordance_proj", False)
+        if self.use_affordance_proj:
+            self.affordance_dim = cfg.get("affordance_dim", self.llm_dim)
+            self.affordance_proj = nn.Sequential(
+                nn.Linear(self.dino_dim, self.affordance_dim),
+                nn.GELU(),
+                nn.Linear(self.affordance_dim, self.affordance_dim),
+                nn.LayerNorm(self.affordance_dim),
+            )
+
         # ====== Decoder and positional encoding ======
         decoder_layer = TransformerDecoderLayer(self.llm_dim, nheads=self.num_heads, dropout=0)
         self.decoder = TransformerDecoder(decoder_layer, num_layers=1, norm=nn.LayerNorm(self.llm_dim))
@@ -342,6 +357,17 @@ class Branch2D(nn.Module):
                 layers = self.dino_model.get_intermediate_layers(image, n=1, return_class_token=True)
             patch_feat = layers[-1][0]                                   # [B, P, dino_dim]
             return self.dino_embed_norm(self.dino_embed(patch_feat))     # [B, P, llm_dim]
+
+    def get_raw_dino_features(self, image):
+        """Return raw DINOv2 patch features [B, P, dino_dim] (no embedding projection)."""
+        H, W = image.shape[2], image.shape[3]
+        pad_h = (14 - H % 14) % 14
+        pad_w = (14 - W % 14) % 14
+        if pad_h > 0 or pad_w > 0:
+            image = torch.nn.functional.pad(image, (0, pad_w, 0, pad_h), mode='constant', value=0)
+        with torch.no_grad():
+            layers = self.dino_model.get_intermediate_layers(image, n=1, return_class_token=True)
+        return layers[-1][0]  # [B, P, dino_dim]
 
     def _image_affordance(self, text_img, text_mask_img, img_feat):
         """

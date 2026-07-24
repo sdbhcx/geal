@@ -57,13 +57,14 @@ def build_dataloader(cfg):
         img_size = cfg.get("img_size", 224)
         sam_mode = cfg.get("sam_mode", "masked_rgb")
         sam_feature_dir = cfg.get("sam_feature_dir", None)
+        use_sam_features = cfg.get("use_sam_features", False)
         use_augmented = cfg.get("use_augmented", False)
         n_aug_q = cfg.get("n_augmented_questions", 50)
         use_func_desc = cfg.get("use_functional_desc", False)
         func_desc_strat = cfg.get("func_desc_strategy", "prefix")
         train_dataset = PiadDataset(cfg["train_split"], cfg["setting"], data_root=cfg["data_root"],
                                     use_image=use_image, img_size=img_size, use_sam=use_sam,
-                                    use_sam_features=True, sam_feature_dir=sam_feature_dir,
+                                    use_sam_features=use_sam_features, sam_feature_dir=sam_feature_dir,
                                     sam_mode=sam_mode,
                                     use_augmented=use_augmented, n_augmented_questions=n_aug_q,
                                     use_functional_desc=use_func_desc, func_desc_strategy=func_desc_strat)
@@ -125,7 +126,7 @@ def build_optimizer(model, opt_cfg):
 
 
 def train_one_epoch(model, loader, optimizer, device, renderer, logger, epoch,
-                    use_image=False, align_weight=0.2, temp=0.07):
+                    use_image=False, use_sam_features=False, align_weight=0.2, temp=0.07):
     """
     Run one training epoch.
 
@@ -154,8 +155,18 @@ def train_one_epoch(model, loader, optimizer, device, renderer, logger, epoch,
             print(f"iter{i}  alloc={alloc:.2f}G reserved={reserved:.2f}G peak={peak:.2f}G", flush=True)
         # 训练集使用预提取的SAM特征，始终返回7个字段
         # 第7个字段是SAM特征 [256, H/16, W/16]
-        point, _, _, question, _, label, sam_feature, bg_features = batch
-        image = sam_feature.to(device) if use_image else None
+        if use_image or use_sam_features:
+            # 7-tuple (use_image 或 use_sam_features 开启)
+            # 若 sam_mode == 'fg_bg' 则返回 8-tuple，额外多一个 bg_tensor
+            if len(batch) == 8:
+                point, _, _, question, _, label, fg_tensor, bg_tensor = batch
+                image = fg_tensor.to(device)
+            else:
+                point, _, _, question, _, label, extra = batch
+                image = extra.to(device)
+        else:
+            point, _, _, question, _, label = batch
+            image = None
 
         optimizer.zero_grad()
         point, label = point.to(device), label.to(device)
@@ -186,15 +197,15 @@ def train_one_epoch(model, loader, optimizer, device, renderer, logger, epoch,
         ck(f"iter{i}: GT渲染")
 
         if use_image:
-            bg_image = bg_features.to(device)
-            pred, z_render, z_img, z_bg = model(question, point, image=image, bg_image=bg_image)
+            # bg_image = bg_features.to(device)
+            pred, z_render, z_img = model(question, point, image=image)
         else:
             pred = model(question, point)
         ck(f"iter{i}: 模型前向")
 
         loss = nn.BCELoss()(pred, gray_images)
         if use_image:
-            loss_align = info_nce(z_render, z_img.detach(), bg_feat=z_bg, temp=temp)
+            loss_align = info_nce(z_render, z_img.detach(), temp=temp)
             loss = loss + align_weight * loss_align
         ck(f"iter{i}: loss")
 
@@ -287,6 +298,7 @@ def main(cfg_path="config/train_stage1.yaml"):
     os.makedirs(save_dir, exist_ok=True)
 
     use_image = cfg["dataset"].get("use_image", False)
+    use_sam_features = cfg["dataset"].get("use_sam_features", False)
     align_weight = train_cfg.get("img_align_weight", 0.2)
     temp = train_cfg.get("img_align_temp", 0.07)
 
@@ -295,7 +307,7 @@ def main(cfg_path="config/train_stage1.yaml"):
 
         # Train and validate
         train_loss = train_one_epoch(model, train_loader, optimizer, device, renderer, logger, epoch,
-                                     use_image=use_image, align_weight=align_weight, temp=temp)
+                                     use_image=use_image, use_sam_features=use_sam_features, align_weight=align_weight, temp=temp)
         val_mae = evaluate(model, test_loader, device, renderer, logger)
         scheduler.step()
 

@@ -1,22 +1,42 @@
 train:
   seed: 42
   epochs: 50
-  batch_size: 8
+  batch_size: 4
   save_dir: runs/train_img/
   name: geal_stage2
   storage: true
-  log_name: train_multi_image.log
+  log_name: train_iam_adm_enable.log
   resume: false
   checkpoint_path: runs/train_img/geal_stage2/best_model_geal_stage2_at_07.04_12.48.37.pt
-  pretrained_2d: runs/train_img/geal_stage1/best_model_geal_stage1_at_06.24_22.30.34.pt
+  pretrained_2d: runs/train_img/geal_stage1/best_model_geal_stage1_PIAD.pt
   gpu: 0
   kl_loss_weight: 0.1        # kept for ckpt compatibility; superseded by align_loss_weight
   align_loss_weight: 0.1    # A1: visibility/contribution-weighted distillation
   cv_loss_weight: 0.05      # A2: cross-view consistency
   vw_gamma: 1.0             # A1: exponent on contrib weight (0 = pure foreground mask)
   render_consistency_weight: 0
-  sim_loss_weight: 0.1      # MIFAG: multi-image global cosine invariance loss
-  aff_loss_weight: 0.1      # CMAT: patch-level affinity matrix alignment loss
+
+  # --- §9 Pipeline: IAM+ADM (replaces lightweight L_sim/L_aff) ---
+  # Master switch: when True, lightweight pipeline is replaced by IAM+ADM.
+  use_iam_adm: true
+  # IAM+ADM only uses its own losses; lightweight flags below are ignored
+  # when use_iam_adm=True.
+  iam_loss_weight: 0.5        # weight for IAM built-in similarity_loss
+  loss_3d2img_weight: 0.5     # weight for L_3d2img with ADM-enhanced features
+
+  # --- Lightweight §9 Pipeline (disabled when use_iam_adm=True) ---
+  # Master switch for lightweight pipeline (L_invariant + L_3d2img + L_contrastive).
+  # Ignored when use_iam_adm=True.
+  use_new_losses: true
+  use_invariant_loss: true    # L_invariant: k images → similar embeddings
+  use_3d2img_loss: true       # L_3d2img: 3D foreground feat ↔ z_img
+  use_contrastive_loss: false # L_contrastive: per-point contrastive (optional)
+  inv_loss_weight: 0.1        # weight for L_invariant
+  contrastive_loss_weight: 0.1 # weight for L_contrastive
+
+  # --- Legacy losses (always disabled when either new pipeline is active) ---
+  sim_loss_weight: 0          # legacy: MIFAG global cosine invariance
+  aff_loss_weight: 0          # legacy: CMAT patch-level affinity alignment
 
 optimizer:
   lr: 1e-4
@@ -29,7 +49,7 @@ renderer:
   sh_degree: 3
   render_resolution: 112
 
-model_2d: 
+model_2d:
   stage1: false
   level: 3
   emb_dim: 512
@@ -39,10 +59,14 @@ model_2d:
   llm_dim: 512
   project_dim: 64
   freeze_text_encoder: false
-  text_encoder_type: /home/junbo/wyn/model/roberta-base
+  text_encoder_type: roberta
+  text_encoder_model: /home/junbo/wyn/model/roberta-base
   normalize_mean: [0.485, 0.456, 0.406]
   normalize_std: [0.229, 0.224, 0.225]
   fuse_level: true
+  # §9 Pipeline: trainable AffordanceProj head
+  use_affordance_proj: true
+  affordance_dim: 512         # output dim; matches llm_dim for cosine with patch_feat_3d
 
 model_3d:
   normal_channel: false
@@ -53,7 +77,8 @@ model_3d:
   n_groups: 40
   project_dim: 64
   freeze_text_encoder: false
-  text_encoder_type: /home/junbo/wyn/model/roberta-base
+  text_encoder_type: roberta
+  text_encoder_model: /home/junbo/wyn/model/roberta-base
   training: true
   level: 3
   fuse_level: true
@@ -104,6 +129,23 @@ dataset:
   num_workers: 8
   shuffle: true
   data_root: /home/datasets/PIAD_root
-  use_image: true      # 开启交互图像分支（MIFAG + CMAT 需要）
+  use_image: true      # 开启交互图像分支（§9 pipeline 需要）
   k_images: 3          # 每个样本采样的交互图张数
   img_size: 224        # 图像分辨率，须为 14 的倍数
+
+# ===== IAM / ADM 配置 =====
+iam:
+  use: true              # 是否启用 IAM 模块（替代轻量 AffordanceProj）
+  dim: 768               # 特征维度，对齐 DINOv2-B 输出
+  num_heads: 6
+  qkv_bias: false
+  invariant_extract_layers: 5
+  image_count: 3         # 与 dataset.k_images 一致
+  image_token_count: 16  # DINOv2 14×14 patch: 224/14=16
+  drop_rate: 0.0
+
+adm:
+  use: true              # 是否启用 ADM 模块（融合 IAM 输出与 3D 点特征）
+  dim: 768               # 与 iam.dim 一致
+  attention_drop: 0.1
+  max_points: 1024       # 降采样最大点数，减少 SWA attention 显存 (2048→1024)

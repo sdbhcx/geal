@@ -195,7 +195,7 @@ class Branch3D(nn.Module):
             # feat_lvl2[1]: [B, emb_dim, 128] → transpose → [B, 128, emb_dim]
             patch_feat_3d = self.img_align_proj(feat_lvl2[1].transpose(1, 2))  # [B, 128, llm_dim]
 
-            return affordance_map, downsampled_feat, gaussian_aff, patch_feat_3d
+            return affordance_map, downsampled_feat, gaussian_aff, patch_feat_3d, fused_feat
         else:
             return affordance_map
         

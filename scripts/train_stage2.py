@@ -17,6 +17,7 @@ sys.path.append(".")
 from utils.utils import seed_torch, read_yaml
 from utils.logger import setup_logger
 from utils.metrics import evaluating, cal_SIM_3d
+from utils.clip_text_encoder import remap_text_encoder_keys
 
 from dataset.laso import LasoDataset
 from dataset.piad import PiadDataset
@@ -332,7 +333,7 @@ def train_one_epoch(model_3d, model_2d, loader, optimizer, device, criterion_hm,
                 logger.debug(
                     f"[Epoch {epoch}] Iter {i}/{len(loader)} | Loss: {loss.item():.4f} "
                     f"(hm: {loss_hm.item():.4f}, inv: {loss_inv.item():.4f}, "
-                    f"3d2img: {loss_3d_val.item():.4f})"
+                    f"3d2img: {loss_3d_val.item():.4f}, con: {loss_con_val.item():.4f})"
                 )
             else:
                 logger.debug(
@@ -430,13 +431,13 @@ def main(cfg_path="config/train_stage2.yaml"):
         ckpt_path = train_cfg["pretrained_2d"]
         logger.debug(f"Loading pretrained 2D model from {ckpt_path}")
         ckpt = torch.load(ckpt_path, map_location=device)
-        model_2d.load_state_dict(ckpt["model"], strict=False)
+        model_2d.load_state_dict(remap_text_encoder_keys(ckpt["model"]), strict=False)
 
     if train_cfg["resume"]:
         ckpt_path = train_cfg["checkpoint_path"]
         logger.debug(f"Resuming 3D model from {ckpt_path}")
         ckpt = torch.load(ckpt_path, map_location=device)
-        model_3d.load_state_dict(ckpt["model"], strict=False)
+        model_3d.load_state_dict(remap_text_encoder_keys(ckpt["model"]), strict=False)
 
     # Build optimizer: include model_2d trainable params (AffordanceProj)
     # only when the §9 pipeline is enabled.

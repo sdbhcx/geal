@@ -22,6 +22,7 @@ from dataset.piad import PiadDataset
 from utils.utils import seed_torch, read_yaml
 from utils.metrics import calculate_batch_iou_auc, calculate_batch_sim, calculate_batch_mae
 from dataset.data_utils import CLASSES, AFFORDANCES
+from utils.clip_text_encoder import remap_text_encoder_keys
 
 # -------------------------------
 # Evaluation core
@@ -173,7 +174,8 @@ def main():
 
     model = Branch3D(cfg["model_3d"])
     ckpt = torch.load(cfg["ckpt"], map_location=device)
-    status = model.load_state_dict(ckpt["model"], strict=False)
+    ckpt_state = remap_text_encoder_keys(ckpt["model"])
+    status = model.load_state_dict(ckpt_state, strict=False)
     model.to(device)
 
     print("\n Checkpoint loaded:", cfg["ckpt"])
@@ -194,7 +196,7 @@ def main():
 
     # Save results
     ckpt_name = os.path.splitext(os.path.basename(cfg["ckpt"]))[0]
-    output_file = os.path.join(args.output, f"{ckpt_name}_{cfg['dataset']}_{cfg['setting']}.txt")
+    output_file = os.path.join(args.output, f"{cfg['log_name']}_{cfg['dataset']}_{cfg['setting']}.txt")
     save_metrics(category_metrics, affordance_metrics, overall_metrics, output_file)
 
 

@@ -20,6 +20,7 @@ from model.branch_3d import Branch3D
 from dataset.corrupt import CorruptDataset
 from utils.utils import seed_torch, read_yaml
 from utils.metrics import calculate_batch_iou_auc, calculate_batch_sim, calculate_batch_mae
+from utils.clip_text_encoder import remap_text_encoder_keys
 
 CORRUPT_TYPES = ['scale', 'jitter', 'rotate', 'dropout_global', 'dropout_local', 'add_global', 'add_local']
 
@@ -98,7 +99,8 @@ def main():
     # Load model
     model = Branch3D(cfg["model_3d"])
     ckpt = torch.load(cfg["ckpt"], map_location=device)
-    model.load_state_dict(ckpt["model"], strict=False)
+    ckpt_state = remap_text_encoder_keys(ckpt["model"])
+    model.load_state_dict(ckpt_state, strict=False)
     model.to(device)
     print(f"\n Checkpoint loaded: {cfg['ckpt']}")
 

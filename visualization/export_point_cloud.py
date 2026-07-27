@@ -23,6 +23,7 @@ from dataset.data_utils import CLASSES, AFFORDANCES
 from model.branch_3d import Branch3D
 from dataset.laso import LasoDataset
 from dataset.piad import PiadDataset
+from utils.clip_text_encoder import remap_text_encoder_keys
 
 
 def select_top_samples(df, top_n=10):
@@ -138,7 +139,8 @@ def main():
     seed_torch(cfg.get("seed", 42))
     model = Branch3D(cfg["model_3d"])
     ckpt = torch.load(cfg["ckpt"], map_location=device)
-    model.load_state_dict(ckpt["model"], strict=False)
+    ckpt_state = remap_text_encoder_keys(ckpt["model"])
+    model.load_state_dict(ckpt_state, strict=False)
     model.to(device)
     print("Loaded checkpoint:", cfg["ckpt"])
 

@@ -8,6 +8,7 @@ into the 3D branch, aligning multi-view 2D representations with 3D features.
 import os
 import torch
 import torch.nn.functional as F
+import torch.nn as nn
 from torch.utils.data import DataLoader
 import numpy as np
 from sklearn.metrics import roc_auc_score
@@ -199,8 +200,9 @@ def train_one_epoch(model_3d, model_2d, loader, optimizer, device, criterion_hm,
             model_2d(question, point, feat_3d, gaussian_aff)
 
         # --- Original heatmap loss ---
+        loss_kld = nn.MSELoss()(render_feats, feat_2d)
         loss_hm = criterion_hm(pred_3d, label)
-        loss = loss_hm
+        loss = loss_hm + train_cfg["kl_loss_weight"]*loss_kld
 
         # =========================================================================
         # §9 Pipeline: IAM+ADM (primary) OR lightweight L_invariant + L_3d2img

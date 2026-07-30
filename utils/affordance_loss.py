@@ -60,7 +60,7 @@ def loss_invariant(z_list, anchor=None, anchor_proj=None, eps=1e-6):
     return loss
 
 
-def loss_3d2img(z_img, z_3d, label, img_3d_proj=None, eps=1e-6):
+def loss_3d2img(z_img, pred_3d, z_3d, label, img_3d_proj=None, eps=1e-6):
     """
     Core loss: aggregate 3D foreground feature and align it with the
     invariant affordance embedding from interaction images.
@@ -80,8 +80,15 @@ def loss_3d2img(z_img, z_3d, label, img_3d_proj=None, eps=1e-6):
         scalar mean cosine distance between foreground 3D feature and z_img.
     """
     # Aggregate 3D side foreground features
-    fg_mask = (label > 0.5).unsqueeze(-1).float()  # [B, N, 1]
-    z_3d_fg = (z_3d * fg_mask).sum(1) / fg_mask.sum(1).clamp_min(eps)  # [B, C_3d]
+    # fg_mask = (label > 0.5).unsqueeze(-1).float()  # [B, N, 1]
+    # z_3d_fg = (z_3d * fg_mask).sum(1) / fg_mask.sum(1).clamp_min(eps)  # [B, C_3d]
+
+    # 用模型当前预测代替 GT
+    with torch.no_grad():
+        soft_mask = torch.sigmoid(pred_3d.detach()).unsqueeze(-1)
+
+    z_3d_fg = (z_3d * soft_mask).sum(1) / \
+            soft_mask.sum(1).clamp_min(1e-6)
 
     z_img_proj = F.normalize(z_img.detach(), dim=-1)
     z_3d_fg_norm = F.normalize(z_3d_fg, dim=-1)

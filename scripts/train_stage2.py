@@ -244,6 +244,7 @@ def train_one_epoch(model_3d, model_2d, loader, optimizer, device, criterion_hm,
             if loss_3d2img_weight > 0:
                 loss_3d_val = loss_3d2img(
                     iam_out["invariant_features"],  # z_img: [B, iam.dim]
+                    pred_3d,
                     P_enhanced.transpose(1, 2),      # z_3d: [B, N, iam.dim]
                     label
                 )
@@ -273,7 +274,7 @@ def train_one_epoch(model_3d, model_2d, loader, optimizer, device, criterion_hm,
                 loss_inv = loss_invariant(z_imgs, anchor=dino_anchors, anchor_proj=anchor_proj)
                 loss = loss + w_inv  * loss_inv
             if use_3d2img:
-                loss_3d_val = loss_3d2img(z_img_mean, feat_3d, label, img_3d_proj=img_3d_proj)
+                loss_3d_val = loss_3d2img(z_img_mean, pred_3d, feat_3d, label, img_3d_proj=img_3d_proj)
                 loss = loss + w_3d   * loss_3d_val
             if use_contrast:
                 z_imgs_stacked = torch.stack(z_imgs)
@@ -334,13 +335,13 @@ def train_one_epoch(model_3d, model_2d, loader, optimizer, device, criterion_hm,
             elif use_new_losses and iam is None:
                 logger.debug(
                     f"[Epoch {epoch}] Iter {i}/{len(loader)} | Loss: {loss.item():.4f} "
-                    f"(hm: {loss_hm.item():.4f}, inv: {loss_inv.item():.4f}, "
-                    f"3d2img: {loss_3d_val.item():.4f}, con: {loss_con_val.item():.4f})"
+                    f"(hm: {loss_hm.item():.4f}, mse: {loss_kld.item():.4f}, "
+                    f"inv: {loss_inv.item():.4f}, 3d2img: {loss_3d_val.item():.4f})"
                 )
             else:
                 logger.debug(
                     f"[Epoch {epoch}] Iter {i}/{len(loader)} | Loss: {loss.item():.4f} "
-                    f"(hm: {loss_hm.item():.4f}, sim: {loss_sim.item():.4f}, aff: {loss_aff.item():.4f})"
+                    f"(hm: {loss_hm.item():.4f}, mse: {loss_kld.item():.4f})"
                 )
 
     return loss_sum / len(loader)

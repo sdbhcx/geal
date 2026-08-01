@@ -1,0 +1,173 @@
+train:
+  seed: 42
+  epochs: 50
+  batch_size: 4
+  save_dir: runs/train_img/
+  name: geal_stage2_v1_tokenizer
+  storage: true
+  log_name: train_v1_tokenizer.log
+  resume: false
+  checkpoint_path: runs/train_img/geal_stage2/best_model_geal_stage2_at_07.04_12.48.37.pt
+  pretrained_2d: runs/train_img/geal_stage1/best_model_geal_stage1_PIAD.pt
+  gpu: 0
+  kl_loss_weight: 0.1        # kept for ckpt compatibility; superseded by align_loss_weight
+  align_loss_weight: 0.1    # A1: visibility/contribution-weighted distillation
+  cv_loss_weight: 0.05      # A2: cross-view consistency
+  vw_gamma: 1.0             # A1: exponent on contrib weight (0 = pure foreground mask)
+  render_consistency_weight: 0
+
+  # --- §9 Pipeline: IAM+ADM (replaces lightweight L_sim/L_aff) ---
+  # Master switch: when True, lightweight pipeline is replaced by IAM+ADM.
+  use_iam_adm: false
+  # IAM+ADM only uses its own losses; lightweight flags below are ignored
+  # when use_iam_adm=True.
+  iam_loss_weight: 0.5        # weight for IAM built-in similarity_loss
+  loss_3d2img_weight: 0.5     # weight for L_3d2img with ADM-enhanced features
+
+  # --- Lightweight §9 Pipeline (disabled when use_iam_adm=True) ---
+  # Master switch for lightweight pipeline (L_invariant + L_3d2img + L_contrastive).
+  # Ignored when use_iam_adm=True.
+  use_new_losses: false
+  use_invariant_loss: false   # disabled to isolate V1 tokenizer
+  use_3d2img_loss: false      # disabled to isolate V1 tokenizer
+  use_contrastive_loss: false # L_contrastive: per-point contrastive (optional)
+  inv_loss_weight: 0.1        # weight for L_invariant
+  contrastive_loss_weight: 0.1 # weight for L_contrastive
+
+  # --- Legacy losses (always disabled when either new pipeline is active) ---
+  sim_loss_weight: 0          # legacy: MIFAG global cosine invariance
+  aff_loss_weight: 0          # legacy: CMAT patch-level affinity alignment
+
+optimizer:
+  lr: 1e-4
+  tlr: 5e-6
+  weight_decay: 1e-3
+  step_size: 10
+  gamma: 0.5
+
+renderer:
+  sh_degree: 3
+  render_resolution: 112
+
+model_2d:
+  stage1: false
+  level: 3
+  emb_dim: 512
+  num_heads: 8
+  n_groups: 40
+  dino_dim: 768
+  llm_dim: 512
+  project_dim: 64
+  freeze_text_encoder: false
+  text_encoder_type: roberta
+  text_encoder_model: /home/junbo/wyn/model/roberta-base
+  normalize_mean: [0.485, 0.456, 0.406]
+  normalize_std: [0.229, 0.224, 0.225]
+  fuse_level: true
+  # §9 Pipeline: trainable AffordanceProj head
+  use_affordance_proj: true
+  affordance_dim: 512         # output dim; matches llm_dim for cosine with patch_feat_3d
+
+model_3d:
+  normal_channel: false
+  num_heads: 4
+  emb_dim: 512
+  llm_dim: 512         # 与 model_2d.llm_dim 对齐，用于 img_align_proj
+  N_p: 64
+  n_groups: 40
+  project_dim: 64
+  freeze_text_encoder: false
+  text_encoder_type: roberta
+  text_encoder_model: /home/junbo/wyn/model/roberta-base
+  training: true
+  level: 3
+  fuse_level: true
+
+  # V1: geometry-only continuous local tokens with explicit point mappings.
+  local_tokenizer:
+    enabled: true
+    token_dim: 512
+    num_tokens: 256
+    neighbor_k: 32
+    hidden_dim: 256
+    pooling: max
+    interpolate_k: 3
+    normalize_local_scale: false
+    fusion: gated_residual
+    fusion_init: 0.0
+
+  point_encoder:
+    layers:
+      - npoint: 512
+        radius: [0.1, 0.2, 0.4]
+        nsample: [32, 64, 128]
+        in_channel: 3
+        mlp:
+          - [32, 32, 64]
+          - [64, 64, 128]
+          - [64, 96, 128]
+      - npoint: 128
+        radius: [0.4, 0.8]
+        nsample: [64, 128]
+        in_channel: 320
+        mlp:
+          - [128, 128, 256]
+          - [128, 196, 256]
+      - npoint: 64
+        radius: [0.2, 0.4]
+        nsample: [16, 32]
+        in_channel: 512
+        mlp:
+          - [128, 128, 256]
+          - [128, 196, 256]
+
+  fp_layers:
+    fp3:
+      in_channel: 512
+      emb_add: true
+      mlp: [768, 512]
+    fp2:
+      in_channel: 832
+      mlp: [768, 512]
+    fp1:
+      in_channel: 518
+      add_normals: true
+      mlp: [512, 512]
+
+dataset:
+  category: piad
+  train_split: train
+  test_split: test
+  setting: seen
+  num_workers: 8
+  shuffle: true
+  data_root: /home/datasets/PIAD_root
+  use_image: true      # 开启交互图像分支（§9 pipeline 需要）
+  k_images: 3          # 每个样本采样的交互图张数
+  img_size: 224        # 图像分辨率，须为 14 的倍数
+
+# ===== IAM / ADM 配置 =====
+iam:
+  use: true              # 是否启用 IAM 模块（替代轻量 AffordanceProj）
+  dim: 768               # 特征维度，对齐 DINOv2-B 输出
+  num_heads: 6
+  qkv_bias: false
+  invariant_extract_layers: 5
+  image_count: 3         # 与 dataset.k_images 一致
+  image_token_count: 16  # DINOv2 14×14 patch: 224/14=16
+  drop_rate: 0.0
+
+adm:
+  use: true              # 是否启用 ADM 模块（融合 IAM 输出与 3D 点特征）
+  dim: 768               # 与 iam.dim 一致
+  attention_drop: 0.1
+  max_points: 1024       # 降采样最大点数，减少 SWA attention 显存 (2048→1024)
+  # === 文本增强: LLM 模板扩充 ===
+  # 需要先运行 scripts/generate_augmented_questions.py 生成增强版 CSV
+  use_augmented: true
+  n_augmented_questions: 50
+
+  # === 文本增强: 功能性描述 ===
+  # 需要先运行 scripts/generate_functional_descriptions.py 生成描述 CSV
+  use_functional_desc: true
+  func_desc_strategy: "prefix"  # "prefix" | "suffix"

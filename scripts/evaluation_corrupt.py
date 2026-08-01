@@ -17,6 +17,7 @@ import sys
 sys.path.append(".")
 
 from model.branch_3d import Branch3D
+from model.local_3d_tokenizer import validate_local_tokenizer_checkpoint
 from dataset.corrupt import CorruptDataset
 from utils.utils import seed_torch, read_yaml
 from utils.metrics import calculate_batch_iou_auc, calculate_batch_sim, calculate_batch_mae
@@ -35,7 +36,7 @@ def evaluate(model, dataloader, device):
     with torch.no_grad():
         for point, cls, label, question, aff_label in tqdm(dataloader, total=len(dataloader), ascii=True):
             point, label = point.float().to(device), label.float().to(device)
-            pred, _ = model(question, point)
+            pred = model(question, point)
             pred, label = pred.cpu().numpy(), label.cpu().numpy()
 
             iou, auc = calculate_batch_iou_auc(pred, label)
@@ -100,6 +101,8 @@ def main():
     model = Branch3D(cfg["model_3d"])
     ckpt = torch.load(cfg["ckpt"], map_location=device)
     ckpt_state = remap_text_encoder_keys(ckpt["model"])
+    if cfg["model_3d"].get("local_tokenizer", {}).get("enabled", False):
+        validate_local_tokenizer_checkpoint(ckpt_state)
     model.load_state_dict(ckpt_state, strict=False)
     model.to(device)
     print(f"\n Checkpoint loaded: {cfg['ckpt']}")

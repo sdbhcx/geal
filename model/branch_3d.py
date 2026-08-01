@@ -7,6 +7,7 @@ from model.attention import TransformerDecoder, TransformerDecoderLayer
 from model.fusion_block import GAFMBlock
 from model.layers import PointFeatureDownsampler, PointEncoder
 from model.gaf_conv import GafConv
+from model.local_3d_tokenizer import Local3DTokenizer, TokenFusion, TokenToPointInterpolator
 from utils.clip_text_encoder import build_text_encoder
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -49,6 +50,35 @@ class Branch3D(nn.Module):
         self.num_levels = cfg["level"]
         self.fuse_level = cfg.get("fuse_level", False)
         self.llm_dim = cfg.get("llm_dim", self.emb_dim)
+
+        # ====== V1 continuous local 3D tokenizer ======
+        tokenizer_cfg = cfg.get("local_tokenizer", {})
+        self.use_local_tokenizer = tokenizer_cfg.get("enabled", False)
+        self.local_tokenizer = None
+        self.token_to_point = None
+        self.token_fusion = None
+        if self.use_local_tokenizer:
+            token_dim = tokenizer_cfg.get("token_dim", self.emb_dim)
+            if token_dim != self.emb_dim:
+                raise ValueError(
+                    "local_tokenizer.token_dim must match model_3d.emb_dim for residual fusion"
+                )
+            self.local_tokenizer = Local3DTokenizer(
+                token_dim=token_dim,
+                num_tokens=tokenizer_cfg.get("num_tokens", 256),
+                neighbor_k=tokenizer_cfg.get("neighbor_k", 32),
+                hidden_dim=tokenizer_cfg.get("hidden_dim", min(256, token_dim)),
+                pooling=tokenizer_cfg.get("pooling", "max"),
+                normalize_local_scale=tokenizer_cfg.get("normalize_local_scale", False),
+            )
+            self.token_to_point = TokenToPointInterpolator(
+                interpolate_k=tokenizer_cfg.get("interpolate_k", 3)
+            )
+            self.token_fusion = TokenFusion(
+                channels=self.emb_dim,
+                mode=tokenizer_cfg.get("fusion", "gated_residual"),
+                init_value=tokenizer_cfg.get("fusion_init", 0.0),
+            )
 
         # ====== Text encoder (configurable via YAML) ======
         self.text_encoder = self._build_text_encoder(cfg)
@@ -168,6 +198,17 @@ class Branch3D(nn.Module):
             concat_feats = torch.cat(dense_feats, dim=1)
             gates, _ = self.gaf_conv(concat_feats)
             fused_feat = sum(gates[:, i].view(-1, 1, 1) * dense_feats[i] for i in range(len(dense_feats)))
+
+        # ========== Step 5b. V1 local token residual fusion ==========
+        if self.use_local_tokenizer:
+            xyz_points = xyz.transpose(1, 2).contiguous()
+            token_features, token_meta = self.local_tokenizer(xyz_points)
+            token_point_features, _ = self.token_to_point(
+                xyz_points,
+                token_meta["centers"],
+                token_features,
+            )
+            fused_feat = self.token_fusion(fused_feat, token_point_features)
 
         # ========== Step 6. Transformer-based decoding ==========
         text_decoded = self.decoder(

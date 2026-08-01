@@ -17,6 +17,7 @@ import sys
 sys.path.append(".")
 
 from model.branch_3d import Branch3D
+from model.local_3d_tokenizer import validate_local_tokenizer_checkpoint
 from dataset.laso import LasoDataset
 from dataset.piad import PiadDataset
 from utils.utils import seed_torch, read_yaml
@@ -175,6 +176,8 @@ def main():
     model = Branch3D(cfg["model_3d"])
     ckpt = torch.load(cfg["ckpt"], map_location=device)
     ckpt_state = remap_text_encoder_keys(ckpt["model"])
+    if cfg["model_3d"].get("local_tokenizer", {}).get("enabled", False):
+        validate_local_tokenizer_checkpoint(ckpt_state)
     status = model.load_state_dict(ckpt_state, strict=False)
     model.to(device)
 
